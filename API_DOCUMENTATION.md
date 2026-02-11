@@ -10,7 +10,7 @@ http://localhost:8000
 
 ## Authentication
 
-All `/merge` requests require an API key in the header:
+All `POST /merge` and `POST /merge-beat-sync` requests require an API key in the header:
 
 ```
 X-API-Key: your-api-key
@@ -64,9 +64,10 @@ POST /merge
 ```json
 {
   "success": true,
-  "message": "Video and audio merged successfully. File will be auto-deleted in 30 seconds.",
+  "message": "Video and audio merged successfully. File will be auto-deleted in 120 seconds.",
   "output_path": "/path/to/output/my_output.mp4",
-  "delete_after_seconds": 30
+  "delete_after_seconds": 120,
+  "processing_time_seconds": 7.812
 }
 ```
 
@@ -74,6 +75,69 @@ POST /merge
 - `401` - Invalid or missing API key
 - `400` - Failed to download file
 - `422` - Validation error (invalid URL format, missing fields)
+- `500` - Server error
+
+---
+
+### Beat-Synced Alternating Merge
+
+```http
+POST /merge-beat-sync
+```
+
+Creates a beat-synced output by alternating exactly two source clips across beat intervals.
+
+**Headers:**
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-API-Key` | Yes | Your API key |
+| `Content-Type` | Yes | `application/json` |
+
+**Request Body:**
+```json
+{
+  "video_urls": [
+    "https://example.com/clip1.mp4",
+    "https://example.com/clip2.mp4"
+  ],
+  "audio_url": "https://example.com/song.mp3",
+  "beat_timestamps": [4.2, 7.2, 10.2, 12.26],
+  "video_cut_starts": [0.0, 0.0],
+  "output_filename": "beat_sync.mp4"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `video_urls` | array | Yes | Must contain exactly 2 video URLs |
+| `audio_url` | string | Yes | URL of the audio file |
+| `beat_timestamps` | array<number> | Yes | Strictly increasing timestamps in seconds from song start |
+| `video_cut_starts` | array<number> | No | Either 2 values (per source video), or N values (per segment) |
+| `output_filename` | string | No | Custom output filename (auto-generated if not provided) |
+
+For beats `[4.2, 7.2, 10.2, 12.26]`, segment durations are:
+- Segment 1: `0.0 -> 4.2` (4.2s) uses video 1
+- Segment 2: `4.2 -> 7.2` (3.0s) uses video 2
+- Segment 3: `7.2 -> 10.2` (3.0s) uses video 1
+- Segment 4: `10.2 -> 12.26` (2.06s) uses video 2
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Beat-synced video created successfully. File will be auto-deleted in 120 seconds.",
+  "output_path": "/path/to/output/beat_sync.mp4",
+  "delete_after_seconds": 120,
+  "processing_time_seconds": 8.914,
+  "segments_created": 4,
+  "total_duration_seconds": 12.26
+}
+```
+
+**Error Responses:**
+- `401` - Invalid or missing API key
+- `422` - Validation error (bad beats/order/video count/cut list format)
+- `400` - Failed to download file
 - `500` - Server error
 
 ---
@@ -197,7 +261,7 @@ curl -O "http://localhost:8000/download/merged.mp4"
 ## Notes
 
 - **Audio handling:** Audio is automatically trimmed if longer than video, or padded with silence if shorter.
-- **Auto-deletion:** Output files are automatically deleted after 30 seconds. Download immediately after merge.
+- **Auto-deletion:** Output files are automatically deleted after 120 seconds. Download immediately after merge.
 - **Concurrency:** Server supports up to 20 simultaneous merge requests.
 - **Supported formats:** MP4, MOV, AVI for video; MP3, WAV, AAC for audio.
 

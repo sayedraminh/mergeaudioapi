@@ -8,7 +8,7 @@ import time
 import logging
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import APIKeyHeader
 
 load_dotenv()
@@ -20,10 +20,11 @@ logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-DELETE_AFTER_SECONDS = 30
+DELETE_AFTER_SECONDS = 120
 MAX_CONCURRENT_JOBS = 20
+MIN_SEGMENT_DURATION_SECONDS = 0.05
 
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
@@ -63,6 +64,20 @@ class MergeResponse(BaseModel):
     message: str
     output_path: Optional[str] = None
     delete_after_seconds: int = DELETE_AFTER_SECONDS
+    processing_time_seconds: Optional[float] = None
+
+
+class BeatSyncMergeRequest(BaseModel):
+    video_urls: List[HttpUrl]
+    audio_url: HttpUrl
+    beat_timestamps: List[float]
+    video_cut_starts: Optional[List[float]] = None
+    output_filename: Optional[str] = None
+
+
+class BeatSyncMergeResponse(MergeResponse):
+    segments_created: int
+    total_duration_seconds: float
 
 
 def schedule_file_deletion(file_path: str, delay_seconds: int = DELETE_AFTER_SECONDS):
@@ -109,6 +124,28 @@ def get_media_duration(file_path: str) -> float:
     return float(result.stdout.strip())
 
 
+def get_video_dimensions(file_path: str) -> Tuple[int, int]:
+    """Read first video stream dimensions with ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0:s=x",
+        file_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"ffprobe stream error: {result.stderr}")
+    raw_dimensions = result.stdout.strip()
+    width_text, height_text = raw_dimensions.split("x")
+    width = int(width_text)
+    height = int(height_text)
+    if width <= 0 or height <= 0:
+        raise Exception(f"Invalid video dimensions from ffprobe: {raw_dimensions}")
+    return width, height
+
+
 def concatenate_videos(video_paths: List[str], output_path: str) -> str:
     """Concatenate multiple videos into one using ffmpeg."""
     if len(video_paths) == 1:
@@ -132,6 +169,254 @@ def concatenate_videos(video_paths: List[str], output_path: str) -> str:
         raise Exception(f"ffmpeg concat error: {result.stderr}")
     
     os.remove(list_file)
+    return output_path
+
+
+def concatenate_videos_reencoded(video_paths: List[str], output_path: str) -> str:
+    """
+    Concatenate videos while re-encoding to a stable output format.
+    This is safer when inputs originate from different source files.
+    """
+    if not video_paths:
+        raise Exception("No video segments provided for concatenation")
+
+    list_file = os.path.join(TEMP_DIR, f"concat_reencoded_list_{uuid.uuid4().hex}.txt")
+    with open(list_file, "w") as f:
+        for video_path in video_paths:
+            f.write(f"file '{video_path}'\n")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"ffmpeg re-encoded concat error: {result.stderr}")
+
+    os.remove(list_file)
+    return output_path
+
+
+def extract_video_segment(
+    input_path: str,
+    output_path: str,
+    start_seconds: float,
+    duration_seconds: float,
+    clip_duration_seconds: float,
+    target_width: int,
+    target_height: int
+) -> str:
+    """Extract one segment from an input video and normalize it for concatenation."""
+    if duration_seconds < MIN_SEGMENT_DURATION_SECONDS:
+        raise Exception(
+            f"Segment duration {duration_seconds} is too short. "
+            f"Minimum is {MIN_SEGMENT_DURATION_SECONDS} seconds."
+        )
+
+    effective_start = start_seconds
+    if clip_duration_seconds > 0:
+        effective_start = start_seconds % clip_duration_seconds
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-stream_loop", "-1",
+        "-ss", f"{effective_start:.6f}",
+        "-i", input_path,
+        "-t", f"{duration_seconds:.6f}",
+        "-map", "0:v:0",
+        "-vf",
+        (
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
+            "fps=30,format=yuv420p"
+        ),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-an",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"ffmpeg segment extraction error: {result.stderr}")
+    return output_path
+
+
+def _validate_beat_timestamps(beat_timestamps: List[float]) -> List[float]:
+    """Validate beat list and return segment durations from song start (0)."""
+    if not beat_timestamps:
+        raise HTTPException(status_code=422, detail="beat_timestamps must contain at least one value")
+
+    segment_durations: List[float] = []
+    previous_beat = 0.0
+    for index, beat in enumerate(beat_timestamps):
+        if beat <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"beat_timestamps[{index}] must be greater than 0"
+            )
+        if beat <= previous_beat:
+            raise HTTPException(
+                status_code=422,
+                detail="beat_timestamps must be strictly increasing"
+            )
+
+        segment_duration = beat - previous_beat
+        if segment_duration < MIN_SEGMENT_DURATION_SECONDS:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Each beat interval must be at least "
+                    f"{MIN_SEGMENT_DURATION_SECONDS} seconds"
+                )
+            )
+        segment_durations.append(segment_duration)
+        previous_beat = beat
+
+    return segment_durations
+
+
+def _resolve_video_cut_starts(
+    video_cut_starts: Optional[List[float]],
+    segment_count: int
+) -> Tuple[List[float], str]:
+    """
+    Returns segment start offsets and mode:
+    - 'per_video': two values [video1_start, video2_start]
+    - 'per_segment': one value per segment
+    - default: per_video with [0.0, 0.0]
+    """
+    if video_cut_starts is None:
+        return [0.0, 0.0], "per_video"
+
+    if len(video_cut_starts) not in (2, segment_count):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "video_cut_starts must have either 2 values "
+                "(one start for each source video) "
+                f"or {segment_count} values (one start for each segment)"
+            )
+        )
+
+    for index, cut_start in enumerate(video_cut_starts):
+        if cut_start < 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"video_cut_starts[{index}] must be >= 0"
+            )
+
+    if len(video_cut_starts) == 2:
+        return video_cut_starts, "per_video"
+    return video_cut_starts, "per_segment"
+
+
+def _build_beat_sync_filter_complex(
+    segment_durations: List[float],
+    segment_starts: List[float],
+    cut_mode: str,
+    clip_durations: List[float],
+    target_width: int,
+    target_height: int
+) -> str:
+    """Build ffmpeg filter_complex for alternating beat-synced segments."""
+    chains: List[str] = []
+    segment_labels: List[str] = []
+
+    for segment_index, segment_duration in enumerate(segment_durations):
+        source_video_index = segment_index % 2
+        source_duration = clip_durations[source_video_index]
+        if source_duration <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Source video {source_video_index + 1} has invalid duration"
+            )
+
+        raw_start = (
+            segment_starts[segment_index]
+            if cut_mode == "per_segment"
+            else segment_starts[source_video_index]
+        )
+        effective_start = raw_start % source_duration
+        end_time = effective_start + segment_duration
+        label = f"v{segment_index}"
+
+        chains.append(
+            f"[{source_video_index}:v]"
+            f"trim=start={effective_start:.6f}:end={end_time:.6f},"
+            "setpts=PTS-STARTPTS,"
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
+            "fps=30,format=yuv420p"
+            f"[{label}]"
+        )
+        segment_labels.append(f"[{label}]")
+
+    chains.append(
+        f"{''.join(segment_labels)}concat=n={len(segment_durations)}:v=1:a=0[vout]"
+    )
+    chains.append("[2:a]apad[aout]")
+    return ";".join(chains)
+
+
+def render_beat_sync_video(
+    video_paths: List[str],
+    audio_path: str,
+    segment_durations: List[float],
+    segment_starts: List[float],
+    cut_mode: str,
+    clip_durations: List[float],
+    target_width: int,
+    target_height: int,
+    output_path: str
+) -> str:
+    """
+    Render beat-synced video in a single ffmpeg pass.
+    This avoids per-segment temp files and speeds up processing.
+    """
+    total_duration = sum(segment_durations)
+    if total_duration <= 0:
+        raise HTTPException(status_code=422, detail="Total duration must be greater than 0")
+
+    filter_complex = _build_beat_sync_filter_complex(
+        segment_durations=segment_durations,
+        segment_starts=segment_starts,
+        cut_mode=cut_mode,
+        clip_durations=clip_durations,
+        target_width=target_width,
+        target_height=target_height
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-stream_loop", "-1",
+        "-i", video_paths[0],
+        "-stream_loop", "-1",
+        "-i", video_paths[1],
+        "-i", audio_path,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "superfast",
+        "-crf", "24",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-t", f"{total_duration:.6f}",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"ffmpeg beat-sync render error: {result.stderr}")
     return output_path
 
 
@@ -196,6 +481,7 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
     - Requires X-API-Key header for authentication
     """
     async with processing_semaphore:
+        request_start_time = time.perf_counter()
         try:
             logger.info(f"Received merge request with {len(request.video_urls)} video(s)")
             session_id = uuid.uuid4().hex
@@ -233,18 +519,134 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
                 logger.info(f"Deleted temp audio: {audio_path}")
             
             schedule_file_deletion(output_path)
+
+            processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
             
             return MergeResponse(
                 success=True,
                 message=f"Video and audio merged successfully. File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds.",
                 output_path=output_path,
-                delete_after_seconds=DELETE_AFTER_SECONDS
+                delete_after_seconds=DELETE_AFTER_SECONDS,
+                processing_time_seconds=processing_time_seconds
             )
         
         except httpx.HTTPError as e:
             raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/merge-beat-sync", response_model=BeatSyncMergeResponse)
+async def merge_videos_with_beat_sync(
+    request: BeatSyncMergeRequest,
+    _: bool = Depends(verify_api_key)
+):
+    """
+    Create a beat-synced video by alternating 2 clips across beat intervals.
+
+    Behavior:
+    - Requires exactly 2 input videos.
+    - Uses beat_timestamps as cut points from song start (0.0s).
+    - Segment durations are: [beat1-0, beat2-beat1, ...].
+    - Alternates source clips as: video1, video2, video1, video2...
+    - Merges the provided audio over the assembled video.
+    """
+    async with processing_semaphore:
+        request_start_time = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        downloaded_video_paths: List[str] = []
+        audio_path: Optional[str] = None
+
+        try:
+            if len(request.video_urls) != 2:
+                raise HTTPException(
+                    status_code=422,
+                    detail="video_urls must contain exactly 2 video URLs"
+                )
+
+            segment_durations = _validate_beat_timestamps(request.beat_timestamps)
+            segment_starts, cut_mode = _resolve_video_cut_starts(
+                request.video_cut_starts,
+                len(segment_durations)
+            )
+
+            logger.info(
+                "Received beat-sync merge request: segments=%s mode=%s",
+                len(segment_durations),
+                cut_mode
+            )
+
+            video_extensions = [
+                os.path.splitext(str(request.video_urls[0]).split("?")[0])[1] or ".mp4",
+                os.path.splitext(str(request.video_urls[1]).split("?")[0])[1] or ".mp4"
+            ]
+            for index in range(2):
+                video_path = os.path.join(
+                    TEMP_DIR,
+                    f"beat_video_{session_id}_{index}{video_extensions[index]}"
+                )
+                downloaded_video_paths.append(video_path)
+
+            audio_ext = os.path.splitext(str(request.audio_url).split("?")[0])[1] or ".mp3"
+            audio_path = os.path.join(TEMP_DIR, f"beat_audio_{session_id}{audio_ext}")
+
+            await asyncio.gather(
+                download_file(str(request.video_urls[0]), downloaded_video_paths[0]),
+                download_file(str(request.video_urls[1]), downloaded_video_paths[1]),
+                download_file(str(request.audio_url), audio_path)
+            )
+
+            clip_durations = [
+                get_media_duration(downloaded_video_paths[0]),
+                get_media_duration(downloaded_video_paths[1])
+            ]
+            target_width, target_height = get_video_dimensions(downloaded_video_paths[0])
+
+            output_filename = request.output_filename or f"beat_sync_output_{session_id}.mp4"
+            output_path = os.path.join(OUTPUT_DIR, output_filename)
+            render_beat_sync_video(
+                video_paths=downloaded_video_paths,
+                audio_path=audio_path,
+                segment_durations=segment_durations,
+                segment_starts=segment_starts,
+                cut_mode=cut_mode,
+                clip_durations=clip_durations,
+                target_width=target_width,
+                target_height=target_height,
+                output_path=output_path
+            )
+            schedule_file_deletion(output_path)
+
+            processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
+            total_duration = round(sum(segment_durations), 3)
+            return BeatSyncMergeResponse(
+                success=True,
+                message=(
+                    "Beat-synced video created successfully. "
+                    f"File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds."
+                ),
+                output_path=output_path,
+                delete_after_seconds=DELETE_AFTER_SECONDS,
+                processing_time_seconds=processing_time_seconds,
+                segments_created=len(segment_durations),
+                total_duration_seconds=total_duration,
+            )
+
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            for temp_video_path in downloaded_video_paths:
+                if os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+                    logger.info(f"Deleted temp beat video: {temp_video_path}")
+
+            if audio_path and os.path.exists(audio_path):
+                os.remove(audio_path)
+                logger.info(f"Deleted temp beat audio: {audio_path}")
 
 
 @app.get("/download/{filename}")
