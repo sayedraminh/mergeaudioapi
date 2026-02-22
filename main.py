@@ -80,6 +80,23 @@ class BeatSyncMergeResponse(MergeResponse):
     total_duration_seconds: float
 
 
+class TrimRequest(BaseModel):
+    video_url: HttpUrl
+    trim_from: Optional[float] = None
+    trim_to: Optional[float] = None
+    output_filename: Optional[str] = None
+
+
+class TrimResponse(BaseModel):
+    success: bool
+    message: str
+    output_path: Optional[str] = None
+    delete_after_seconds: int = DELETE_AFTER_SECONDS
+    processing_time_seconds: Optional[float] = None
+    original_duration_seconds: Optional[float] = None
+    trimmed_duration_seconds: Optional[float] = None
+
+
 def schedule_file_deletion(file_path: str, delay_seconds: int = DELETE_AFTER_SECONDS):
     """Schedule a file to be deleted after a delay using a background thread."""
     def delete_after_delay():
@@ -647,6 +664,115 @@ async def merge_videos_with_beat_sync(
             if audio_path and os.path.exists(audio_path):
                 os.remove(audio_path)
                 logger.info(f"Deleted temp beat audio: {audio_path}")
+
+
+def trim_video(input_path: str, output_path: str, trim_from: Optional[float], trim_to: Optional[float]) -> Tuple[float, float]:
+    """
+    Trim a video using ffmpeg.
+    - trim_from only: cut from that point to end of video
+    - trim_to only: cut from start to that point
+    - both: extract the segment between trim_from and trim_to
+    - neither: raises an error
+    Returns (original_duration, trimmed_duration).
+    """
+    original_duration = get_media_duration(input_path)
+
+    if trim_from is not None and trim_from < 0:
+        raise ValueError("trim_from must be >= 0")
+    if trim_to is not None and trim_to < 0:
+        raise ValueError("trim_to must be >= 0")
+    if trim_from is not None and trim_to is not None and trim_from >= trim_to:
+        raise ValueError("trim_from must be less than trim_to")
+    if trim_from is not None and trim_from >= original_duration:
+        raise ValueError(f"trim_from ({trim_from}) exceeds video duration ({original_duration})")
+    if trim_to is not None and trim_to > original_duration:
+        raise ValueError(f"trim_to ({trim_to}) exceeds video duration ({original_duration})")
+
+    cmd = ["ffmpeg", "-y"]
+
+    if trim_from is not None:
+        cmd += ["-ss", f"{trim_from:.6f}"]
+
+    cmd += ["-i", input_path]
+
+    if trim_to is not None:
+        if trim_from is not None:
+            cmd += ["-t", f"{(trim_to - trim_from):.6f}"]
+        else:
+            cmd += ["-t", f"{trim_to:.6f}"]
+
+    cmd += ["-c", "copy", output_path]
+
+    logger.info(f"Running trim ffmpeg command")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"ffmpeg trim error: {result.stderr}")
+
+    trimmed_duration = get_media_duration(output_path)
+    return original_duration, trimmed_duration
+
+
+@app.post("/trim", response_model=TrimResponse)
+async def trim_video_endpoint(request: TrimRequest, _: bool = Depends(verify_api_key)):
+    """
+    Trim a video clip.
+
+    Modes:
+    - trim_from only: removes the first N seconds, returns the rest
+    - trim_to only: keeps the first N seconds, removes the rest
+    - both trim_from and trim_to: extracts the segment between those two points
+    - Requires X-API-Key header for authentication
+    """
+    async with processing_semaphore:
+        request_start_time = time.perf_counter()
+        video_path = None
+        try:
+            if request.trim_from is None and request.trim_to is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="At least one of trim_from or trim_to must be provided"
+                )
+
+            logger.info(f"Received trim request: trim_from={request.trim_from}, trim_to={request.trim_to}")
+            session_id = uuid.uuid4().hex
+
+            video_ext = os.path.splitext(str(request.video_url).split("?")[0])[1] or ".mp4"
+            video_path = os.path.join(TEMP_DIR, f"trim_input_{session_id}{video_ext}")
+            await download_file(str(request.video_url), video_path)
+
+            output_filename = request.output_filename or f"trimmed_{session_id}.mp4"
+            output_path = os.path.join(OUTPUT_DIR, output_filename)
+
+            original_duration, trimmed_duration = trim_video(
+                video_path, output_path, request.trim_from, request.trim_to
+            )
+
+            schedule_file_deletion(output_path)
+
+            processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
+
+            return TrimResponse(
+                success=True,
+                message=f"Video trimmed successfully. File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds.",
+                output_path=output_path,
+                delete_after_seconds=DELETE_AFTER_SECONDS,
+                processing_time_seconds=processing_time_seconds,
+                original_duration_seconds=round(original_duration, 3),
+                trimmed_duration_seconds=round(trimmed_duration, 3)
+            )
+
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if video_path and os.path.exists(video_path):
+                os.remove(video_path)
+                logger.info(f"Deleted temp trim input: {video_path}")
 
 
 @app.get("/download/{filename}")

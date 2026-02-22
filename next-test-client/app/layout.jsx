@@ -1,8 +1,8 @@
 import "./globals.css";
 
 export const metadata = {
-  title: "Beat Sync Merge Tester",
-  description: "Test client for /merge-beat-sync endpoint"
+  title: "Video API Tester",
+  description: "Test client for video merge, beat-sync, and trim endpoints"
 };
 
 export default function RootLayout({ children }) {

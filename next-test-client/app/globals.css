@@ -30,6 +30,34 @@ body {
   padding: 24px;
 }
 
+.nav-links {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid #dce4f2;
+}
+
+.nav-links a {
+  color: #1f57d6;
+  text-decoration: none;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: 6px;
+}
+
+.nav-links a:hover {
+  background: #eef3ff;
+}
+
+.nav-active {
+  font-weight: 700;
+  color: #102039;
+  padding: 4px 10px;
+  background: #eef3ff;
+  border-radius: 6px;
+}
+
 h1 {
   margin-top: 0;
   margin-bottom: 8px;
@@ -60,16 +88,19 @@ label {
 
 input,
 textarea,
+select,
 button {
   font: inherit;
 }
 
 input,
-textarea {
+textarea,
+select {
   border: 1px solid #bccae3;
   border-radius: 10px;
   padding: 10px 12px;
   width: 100%;
+  background: #ffffff;
 }
 
 textarea {

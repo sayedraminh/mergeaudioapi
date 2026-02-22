@@ -1,6 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 
 const DEFAULT_BEATS = "4.20,7.20,10.20,12.26";
 const DEFAULT_VIDEO_CUTS = "0,0";
@@ -112,6 +113,11 @@ export default function Page() {
   return (
     <main className="container">
       <section className="card">
+        <nav className="nav-links">
+          <span className="nav-active">Beat Sync Tester</span>
+          <Link href="/trim">Trim Tester</Link>
+        </nav>
+
         <h1>Beat Sync Merge Tester</h1>
         <p>
           Sends requests to the local Next API route, which proxies to your FastAPI

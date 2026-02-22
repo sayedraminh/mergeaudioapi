@@ -10,7 +10,7 @@ http://localhost:8000
 
 ## Authentication
 
-All `POST /merge` and `POST /merge-beat-sync` requests require an API key in the header:
+All `POST /merge`, `POST /merge-beat-sync`, and `POST /trim` requests require an API key in the header:
 
 ```
 X-API-Key: your-api-key
@@ -142,6 +142,85 @@ For beats `[4.2, 7.2, 10.2, 12.26]`, segment durations are:
 
 ---
 
+### Trim Video
+
+```http
+POST /trim
+```
+
+Trims a video clip by cutting from the start, from the end, or extracting a specific range.
+
+**Headers:**
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-API-Key` | Yes | Your API key |
+| `Content-Type` | Yes | `application/json` |
+
+**Request Body:**
+```json
+{
+  "video_url": "https://example.com/clip.mp4",
+  "trim_from": 1.07,
+  "trim_to": 10.5,
+  "output_filename": "trimmed.mp4"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `video_url` | string | Yes | URL of the video to trim |
+| `trim_from` | number | No* | Start point in seconds — everything before this is removed |
+| `trim_to` | number | No* | End point in seconds — everything after this is removed |
+| `output_filename` | string | No | Custom output filename (auto-generated if not provided) |
+
+\* At least one of `trim_from` or `trim_to` must be provided.
+
+**Trim Modes:**
+
+| Mode | Fields | Behavior |
+|------|--------|----------|
+| Cut from start | `trim_from` only | Removes the first N seconds, returns the rest |
+| Cut from end | `trim_to` only | Keeps the first N seconds, removes the rest |
+| Extract range | Both | Extracts the segment between `trim_from` and `trim_to` |
+
+**Examples:**
+
+*Remove the first 1.07 seconds:*
+```json
+{ "video_url": "https://example.com/clip.mp4", "trim_from": 1.07 }
+```
+
+*Keep only the first 10 seconds:*
+```json
+{ "video_url": "https://example.com/clip.mp4", "trim_to": 10.0 }
+```
+
+*Extract from 5s to 15s:*
+```json
+{ "video_url": "https://example.com/clip.mp4", "trim_from": 5.0, "trim_to": 15.0 }
+```
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Video trimmed successfully. File will be auto-deleted in 120 seconds.",
+  "output_path": "/path/to/output/trimmed.mp4",
+  "delete_after_seconds": 120,
+  "processing_time_seconds": 1.234,
+  "original_duration_seconds": 30.5,
+  "trimmed_duration_seconds": 20.0
+}
+```
+
+**Error Responses:**
+- `401` - Invalid or missing API key
+- `422` - Validation error (missing both trim fields, trim_from >= trim_to, values exceed duration)
+- `400` - Failed to download file
+- `500` - Server error
+
+---
+
 ### Download Output File
 
 ```http
@@ -252,6 +331,15 @@ curl -X POST "http://localhost:8000/merge" \
     "output_filename": "merged.mp4"
   }'
 
+# Trim — remove first 1.07 seconds
+curl -X POST "http://localhost:8000/trim" \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "video_url": "https://example.com/clip.mp4",
+    "trim_from": 1.07
+  }'
+
 # Download result
 curl -O "http://localhost:8000/download/merged.mp4"
 ```
@@ -261,8 +349,9 @@ curl -O "http://localhost:8000/download/merged.mp4"
 ## Notes
 
 - **Audio handling:** Audio is automatically trimmed if longer than video, or padded with silence if shorter.
-- **Auto-deletion:** Output files are automatically deleted after 120 seconds. Download immediately after merge.
-- **Concurrency:** Server supports up to 20 simultaneous merge requests.
+- **Trim uses stream copy:** The `/trim` endpoint uses `-c copy` for near-instant trimming without re-encoding. Cuts may be slightly off from the exact timestamp due to keyframe alignment.
+- **Auto-deletion:** Output files are automatically deleted after 120 seconds. Download immediately after processing.
+- **Concurrency:** Server supports up to 20 simultaneous requests.
 - **Supported formats:** MP4, MOV, AVI for video; MP3, WAV, AAC for audio.
 
 ## Requirements
