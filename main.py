@@ -514,11 +514,18 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
             audio_path = os.path.join(TEMP_DIR, f"audio_{session_id}{audio_ext}")
             await download_file(str(request.audio_url), audio_path)
             
+            for i, vp in enumerate(video_paths):
+                vp_dur = get_media_duration(vp)
+                logger.info(f"Input clip {i} duration: {vp_dur}s — {vp}")
+
             concatenated_path = os.path.join(TEMP_DIR, f"concat_{session_id}.mp4")
             if len(video_paths) > 1:
-                concatenate_videos(video_paths, concatenated_path)
+                concatenate_videos_reencoded(video_paths, concatenated_path)
             else:
                 concatenated_path = video_paths[0]
+
+            concat_dur = get_media_duration(concatenated_path)
+            logger.info(f"Concatenated video duration: {concat_dur}s")
             
             output_filename = request.output_filename or f"output_{session_id}.mp4"
             output_path = os.path.join(OUTPUT_DIR, output_filename)
