@@ -191,34 +191,34 @@ def concatenate_videos(video_paths: List[str], output_path: str) -> str:
 
 def concatenate_videos_reencoded(video_paths: List[str], output_path: str) -> str:
     """
-    Concatenate videos while re-encoding to a stable output format.
-    This is safer when inputs originate from different source files.
+    Concatenate videos using the filter_complex concat filter.
+    Each input is decoded independently so source timestamps are discarded,
+    preventing duration inflation from containers with non-zero start times.
     """
     if not video_paths:
         raise Exception("No video segments provided for concatenation")
 
-    list_file = os.path.join(TEMP_DIR, f"concat_reencoded_list_{uuid.uuid4().hex}.txt")
-    with open(list_file, "w") as f:
-        for video_path in video_paths:
-            f.write(f"file '{video_path}'\n")
+    cmd = ["ffmpeg", "-y"]
+    for video_path in video_paths:
+        cmd += ["-i", video_path]
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", list_file,
+    n = len(video_paths)
+    filter_inputs = "".join(f"[{i}:v]" for i in range(n))
+    filter_complex = f"{filter_inputs}concat=n={n}:v=1:a=0[vout]"
+
+    cmd += [
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
-        "-an",
         output_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise Exception(f"ffmpeg re-encoded concat error: {result.stderr}")
 
-    os.remove(list_file)
     return output_path
 
 
@@ -693,7 +693,8 @@ def trim_video(input_path: str, output_path: str, trim_from: Optional[float], tr
     if trim_from is not None and trim_from >= original_duration:
         raise ValueError(f"trim_from ({trim_from}) exceeds video duration ({original_duration})")
     if trim_to is not None and trim_to > original_duration:
-        raise ValueError(f"trim_to ({trim_to}) exceeds video duration ({original_duration})")
+        logger.warning(f"trim_to ({trim_to}) exceeds video duration ({original_duration}), clamping to video end")
+        trim_to = original_duration
 
     cmd = ["ffmpeg", "-y"]
 

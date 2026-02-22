@@ -127,6 +127,14 @@ button:disabled {
   cursor: not-allowed;
 }
 
+.btn-secondary {
+  background: #eef3ff;
+  color: #1f57d6;
+  border: 1px solid #bccae3;
+  font-weight: 600;
+  padding: 8px 14px;
+}
+
 .preview {
   font-size: 14px;
   color: #2f436b;

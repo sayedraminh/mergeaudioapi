@@ -107,6 +107,7 @@ export default function TrimPage() {
       <section className="card">
         <nav className="nav-links">
           <Link href="/">Beat Sync Tester</Link>
+          <Link href="/merge">Merge Tester</Link>
           <span className="nav-active">Trim Tester</span>
         </nav>
 

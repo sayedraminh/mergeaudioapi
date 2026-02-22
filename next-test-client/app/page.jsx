@@ -115,6 +115,7 @@ export default function Page() {
       <section className="card">
         <nav className="nav-links">
           <span className="nav-active">Beat Sync Tester</span>
+          <Link href="/merge">Merge Tester</Link>
           <Link href="/trim">Trim Tester</Link>
         </nav>
 
