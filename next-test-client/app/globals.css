@@ -32,6 +32,7 @@ body {
 
 .nav-links {
   display: flex;
+  flex-wrap: wrap;
   gap: 16px;
   margin-bottom: 12px;
   padding-bottom: 12px;
@@ -161,6 +162,15 @@ button:disabled {
 .result a {
   color: #064e3b;
   font-weight: 700;
+}
+
+.frame-preview {
+  width: 100%;
+  max-width: 420px;
+  border-radius: 12px;
+  border: 1px solid #b8d0c0;
+  background: #ffffff;
+  box-shadow: 0 8px 22px rgba(16, 32, 57, 0.08);
 }
 
 @media (max-width: 720px) {

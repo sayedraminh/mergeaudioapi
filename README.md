@@ -7,6 +7,10 @@ A FastAPI server that merges multiple videos and adds an audio track with automa
 - Merge multiple video URLs into a single video
 - Add audio track to merged video
 - Beat-synced alternating merge for exactly 2 videos (`/merge-beat-sync`)
+- Trim videos (`/trim`)
+- Reverse videos (`/reverse`)
+- Speed up or slow down videos (`/speed`)
+- Extract the 5th frame of a video as a PNG (`/extract-fifth-frame`)
 - Automatic audio trimming/padding to match video duration
 - API key authentication
 - Auto-delete output files after 120 seconds
@@ -87,6 +91,54 @@ Body: {
 
 With beats `[4.2, 7.2, 10.2, 12.26]`, segment durations become `[4.2, 3.0, 3.0, 2.06]` and source clips alternate as `1,2,1,2`.
 
+### Trim Video
+```
+POST /trim
+Headers: X-API-Key: your-api-key
+Body: {
+  "video_url": "https://example.com/video.mp4",
+  "trim_from": 1.0,
+  "trim_to": 8.0,
+  "output_filename": "trimmed.mp4"
+}
+```
+
+### Reverse Video
+```
+POST /reverse
+Headers: X-API-Key: your-api-key
+Body: {
+  "video_url": "https://example.com/video.mp4",
+  "output_filename": "reversed.mp4"
+}
+```
+
+### Speed / Slow Video
+```
+POST /speed
+Headers: X-API-Key: your-api-key
+Body: {
+  "video_url": "https://example.com/video.mp4",
+  "speed": 1.3,
+  "output_filename": "faster.mp4"
+}
+```
+
+### Extract the 5th Frame
+```
+POST /extract-fifth-frame
+Headers: X-API-Key: your-api-key
+Body: {
+  "video_url": "https://example.com/video.mp4",
+  "output_filename": "frame_preview.png"
+}
+```
+
+Returns the 5th frame immediately as an `image/png` response. There is no follow-up `/download` step for this endpoint.
+The endpoint now supports either:
+- a remote `video_url` in JSON
+- or a multipart `video_file` upload for quick local testing
+
 ### Download Output
 ```
 GET /download/{filename}
@@ -94,10 +146,11 @@ GET /download/{filename}
 
 ## Documentation
 
-See [API_DOCUMENTATION.md](API_DOCUMENTATION.md) for full API documentation with code examples.
+See [MERGE_API_DOCUMENTATION.md](MERGE_API_DOCUMENTATION.md) for full API documentation with code examples.
 
 Client integration handoff:
 - [CLIENT_SIDE_IMPLEMENTATION.md](CLIENT_SIDE_IMPLEMENTATION.md)
+- [CLIENT_SIDE_FRAME_EXTRACTION.md](CLIENT_SIDE_FRAME_EXTRACTION.md)
 - [next-test-client/README.md](next-test-client/README.md) (manual tester app)
 
 ## License

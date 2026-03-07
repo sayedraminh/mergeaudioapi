@@ -117,6 +117,9 @@ export default function Page() {
           <span className="nav-active">Beat Sync Tester</span>
           <Link href="/merge">Merge Tester</Link>
           <Link href="/trim">Trim Tester</Link>
+          <Link href="/reverse">Reverse Tester</Link>
+          <Link href="/speed">Speed Tester</Link>
+          <Link href="/extract-fifth-frame">Frame Tester</Link>
         </nav>
 
         <h1>Beat Sync Merge Tester</h1>

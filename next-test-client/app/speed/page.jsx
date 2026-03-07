@@ -12,30 +12,13 @@ function extractFilename(path) {
   return parts[parts.length - 1] || "";
 }
 
-export default function MergePage() {
-  const [videoUrls, setVideoUrls] = useState(["", ""]);
-  const [audioUrl, setAudioUrl] = useState("");
+export default function SpeedPage() {
+  const [videoUrl, setVideoUrl] = useState("");
+  const [speed, setSpeed] = useState("1.3");
   const [outputFilename, setOutputFilename] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [successData, setSuccessData] = useState(null);
-
-  function updateVideoUrl(index, value) {
-    setVideoUrls((prev) => {
-      const next = [...prev];
-      next[index] = value;
-      return next;
-    });
-  }
-
-  function addVideoField() {
-    setVideoUrls((prev) => [...prev, ""]);
-  }
-
-  function removeVideoField(index) {
-    if (videoUrls.length <= 1) return;
-    setVideoUrls((prev) => prev.filter((_, i) => i !== index));
-  }
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -43,28 +26,21 @@ export default function MergePage() {
     setErrorMessage("");
     setSuccessData(null);
 
-    const urls = videoUrls.map((u) => u.trim()).filter(Boolean);
-
-    if (urls.length === 0) {
-      setErrorMessage("At least one video URL is required.");
-      setIsSubmitting(false);
-      return;
-    }
-
-    if (!audioUrl.trim()) {
-      setErrorMessage("Audio URL is required.");
+    const parsedSpeed = Number(speed);
+    if (Number.isNaN(parsedSpeed) || parsedSpeed <= 0) {
+      setErrorMessage("Speed must be a number greater than 0 (for example 1.3 or 0.3).");
       setIsSubmitting(false);
       return;
     }
 
     const payload = {
-      video_urls: urls,
-      audio_url: audioUrl.trim(),
+      video_url: videoUrl.trim(),
+      speed: parsedSpeed,
       output_filename: outputFilename.trim() || undefined
     };
 
     try {
-      const response = await fetch("/api/merge", {
+      const response = await fetch("/api/speed", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
@@ -93,59 +69,44 @@ export default function MergePage() {
       <section className="card">
         <nav className="nav-links">
           <Link href="/">Beat Sync Tester</Link>
-          <span className="nav-active">Merge Tester</span>
+          <Link href="/merge">Merge Tester</Link>
           <Link href="/trim">Trim Tester</Link>
           <Link href="/reverse">Reverse Tester</Link>
-          <Link href="/speed">Speed Tester</Link>
+          <span className="nav-active">Speed Tester</span>
           <Link href="/extract-fifth-frame">Frame Tester</Link>
         </nav>
 
-        <h1>Video Merge Tester</h1>
+        <h1>Speed/Slow Video Tester</h1>
         <p>
-          Concatenate video clips and overlay an audio track. Proxies to the FastAPI
-          <code> /merge </code>
+          Change video playback speed by URL and factor. Proxies to the FastAPI
+          <code> /speed </code>
           endpoint.
         </p>
 
         <form onSubmit={handleSubmit} className="form">
-          {videoUrls.map((url, index) => (
-            <label key={index}>
-              Video URL {index + 1}
-              <div style={{ display: "flex", gap: "8px" }}>
-                <input
-                  type="url"
-                  required
-                  value={url}
-                  onChange={(event) => updateVideoUrl(index, event.target.value)}
-                  placeholder={`https://.../video${index + 1}.mp4`}
-                  style={{ flex: 1 }}
-                />
-                {videoUrls.length > 1 ? (
-                  <button
-                    type="button"
-                    onClick={() => removeVideoField(index)}
-                    className="btn-secondary"
-                  >
-                    Remove
-                  </button>
-                ) : null}
-              </div>
-            </label>
-          ))}
-
-          <button type="button" onClick={addVideoField} className="btn-secondary">
-            + Add another video
-          </button>
-
           <label>
-            Audio URL
+            Video URL
             <input
               type="url"
               required
-              value={audioUrl}
-              onChange={(event) => setAudioUrl(event.target.value)}
-              placeholder="https://.../song.mp3"
+              value={videoUrl}
+              onChange={(event) => setVideoUrl(event.target.value)}
+              placeholder="https://.../video.mp4"
             />
+          </label>
+
+          <label>
+            Speed Factor
+            <input
+              type="number"
+              step="any"
+              min="0.000001"
+              required
+              value={speed}
+              onChange={(event) => setSpeed(event.target.value)}
+              placeholder="1.3 (faster) or 0.3 (slower)"
+            />
+            <small>Use values above 1.0 to speed up, below 1.0 to slow down.</small>
           </label>
 
           <label>
@@ -154,12 +115,12 @@ export default function MergePage() {
               type="text"
               value={outputFilename}
               onChange={(event) => setOutputFilename(event.target.value)}
-              placeholder="merged_output.mp4"
+              placeholder="speed_changed_output.mp4"
             />
           </label>
 
           <button type="submit" disabled={isSubmitting}>
-            {isSubmitting ? "Processing..." : "Merge Videos"}
+            {isSubmitting ? "Processing..." : "Apply Speed Change"}
           </button>
         </form>
 
@@ -168,11 +129,14 @@ export default function MergePage() {
         {successData ? (
           <div className="result">
             <p>{successData.message}</p>
+            <p>Speed factor: {successData.speed}x</p>
+            <p>Original duration: {successData.original_duration_seconds}s</p>
+            <p>Result duration: {successData.transformed_duration_seconds}s</p>
             <p>Processing time: {successData.processing_time_seconds ?? "n/a"}s</p>
             <p>Delete after: {successData.delete_after_seconds}s</p>
             {successData.filename ? (
               <a href={`/api/download/${encodeURIComponent(successData.filename)}`}>
-                Download merged video
+                Download speed-adjusted video
               </a>
             ) : null}
           </div>

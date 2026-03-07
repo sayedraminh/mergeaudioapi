@@ -1,6 +1,6 @@
 # Next Test Client
 
-Minimal Next.js app for testing the FastAPI beat-sync endpoint.
+Minimal Next.js app for testing the FastAPI video endpoints.
 
 ## 1) Setup
 
@@ -20,9 +20,21 @@ Open `http://localhost:3000`.
 
 ## 3) What this app does
 
-- UI form collects `video_urls`, `audio_url`, `beat_timestamps`, `video_cut_starts`, `output_filename`.
-- `POST /api/merge-beat-sync` (Next route handler) proxies request to FastAPI `/merge-beat-sync`.
+- `POST /api/merge-beat-sync` proxies to FastAPI `/merge-beat-sync`.
+- `POST /api/merge` proxies to FastAPI `/merge`.
+- `POST /api/trim` proxies to FastAPI `/trim`.
+- `POST /api/reverse` proxies to FastAPI `/reverse`.
+- `POST /api/speed` proxies to FastAPI `/speed`.
+- `POST /api/extract-fifth-frame` proxies to FastAPI `/extract-fifth-frame` and streams back `image/png`.
 - `GET /api/download/[filename]` proxies file download from FastAPI `/download/{filename}`.
+
+Available UI pages:
+- `/` beat-sync tester
+- `/merge` merge tester
+- `/trim` trim tester
+- `/reverse` reverse tester
+- `/speed` speed/slow tester
+- `/extract-fifth-frame` fifth-frame PNG tester with URL and local file upload support
 
 ## 4) Notes
 

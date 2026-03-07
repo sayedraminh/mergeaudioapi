@@ -109,6 +109,9 @@ export default function TrimPage() {
           <Link href="/">Beat Sync Tester</Link>
           <Link href="/merge">Merge Tester</Link>
           <span className="nav-active">Trim Tester</span>
+          <Link href="/reverse">Reverse Tester</Link>
+          <Link href="/speed">Speed Tester</Link>
+          <Link href="/extract-fifth-frame">Frame Tester</Link>
         </nav>
 
         <h1>Video Trim Tester</h1>
