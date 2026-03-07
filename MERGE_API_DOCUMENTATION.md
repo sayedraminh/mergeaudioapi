@@ -10,7 +10,7 @@ http://localhost:8000
 
 ## Authentication
 
-All `POST /merge`, `POST /merge-beat-sync`, and `POST /trim` requests require an API key in the header:
+All `POST /merge`, `POST /merge-beat-sync`, `POST /trim`, `POST /reverse`, `POST /speed`, and `POST /extract-fifth-frame` requests require an API key in the header:
 
 ```
 X-API-Key: your-api-key
@@ -217,6 +217,175 @@ Trims a video clip by cutting from the start, from the end, or extracting a spec
 - `401` - Invalid or missing API key
 - `422` - Validation error (missing both trim fields, trim_from >= trim_to, values exceed duration)
 - `400` - Failed to download file
+- `500` - Server error
+
+---
+
+### Reverse Video
+
+```http
+POST /reverse
+```
+
+Reverses the full video timeline. If the source has audio, audio is reversed too.
+
+**Headers:**
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-API-Key` | Yes | Your API key |
+| `Content-Type` | Yes | `application/json` |
+
+**Request Body:**
+```json
+{
+  "video_url": "https://example.com/clip.mp4",
+  "output_filename": "reversed.mp4"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `video_url` | string | Yes | URL of the source video |
+| `output_filename` | string | No | Custom output filename |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Video reversed successfully. File will be auto-deleted in 120 seconds.",
+  "output_path": "/path/to/output/reversed.mp4",
+  "delete_after_seconds": 120,
+  "processing_time_seconds": 2.219,
+  "original_duration_seconds": 12.26,
+  "transformed_duration_seconds": 12.26
+}
+```
+
+**Error Responses:**
+- `401` - Invalid or missing API key
+- `400` - Failed to download file
+- `422` - Validation error (invalid URL format, missing fields)
+- `500` - Server error
+
+---
+
+### Speed / Slow Video
+
+```http
+POST /speed
+```
+
+Changes playback speed using a `speed` factor:
+- `> 1.0` speeds up (for example `1.3`)
+- `< 1.0` slows down (for example `0.3`)
+
+**Headers:**
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-API-Key` | Yes | Your API key |
+| `Content-Type` | Yes | `application/json` |
+
+**Request Body:**
+```json
+{
+  "video_url": "https://example.com/clip.mp4",
+  "speed": 1.3,
+  "output_filename": "speed_changed.mp4"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `video_url` | string | Yes | URL of the source video |
+| `speed` | number | Yes | Playback factor; must be > 0 |
+| `output_filename` | string | No | Custom output filename |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Video speed changed successfully. File will be auto-deleted in 120 seconds.",
+  "output_path": "/path/to/output/speed_changed.mp4",
+  "delete_after_seconds": 120,
+  "processing_time_seconds": 2.108,
+  "original_duration_seconds": 12.26,
+  "transformed_duration_seconds": 9.431,
+  "speed": 1.3
+}
+```
+
+**Error Responses:**
+- `401` - Invalid or missing API key
+- `400` - Failed to download file
+- `422` - Validation error (`speed <= 0`, invalid payload)
+- `500` - Server error
+
+---
+
+### Extract the 5th Frame
+
+```http
+POST /extract-fifth-frame
+```
+
+Downloads a video or accepts an uploaded file, extracts frame number 5, and streams the PNG back in the same response.
+
+**Headers:**
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-API-Key` | Yes | Your API key |
+| `Content-Type` | Yes | `application/json` |
+
+**Request Body:**
+```json
+{
+  "video_url": "https://example.com/clip.mp4",
+  "output_filename": "frame_preview.png"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `video_url` | string | Yes* | URL of the source video |
+| `output_filename` | string | No | Preferred download filename; server always returns a `.png` |
+
+Alternative multipart form request for local testing:
+
+```bash
+curl -X POST http://localhost:8000/extract-fifth-frame \
+  -H "X-API-Key: your-api-key" \
+  -F "video_file=@/absolute/path/to/local-video.mp4" \
+  -F "output_filename=frame_preview.png" \
+  --output frame_preview.png
+```
+
+Multipart form fields:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `video_file` | file | Yes* | Local video file upload |
+| `video_url` | string | Yes* | Remote video URL |
+| `output_filename` | string | No | Preferred download filename |
+
+\* Provide exactly one of `video_file` or `video_url`.
+
+**Success Response (200):**
+- Content-Type: `image/png`
+- Body: binary PNG image containing the 5th frame
+
+**Example curl:**
+```bash
+curl -X POST http://localhost:8000/extract-fifth-frame \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{"video_url":"https://example.com/clip.mp4","output_filename":"frame_preview.png"}' \
+  --output frame_preview.png
+```
+
+**Error Responses:**
+- `401` - Invalid or missing API key
+- `400` - Failed to download file
+- `422` - Validation error (invalid URL, missing source, both sources provided, fewer than 5 frames)
 - `500` - Server error
 
 ---

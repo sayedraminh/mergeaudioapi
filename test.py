@@ -3,6 +3,8 @@ import httpx
 import asyncio
 import os
 import tempfile
+import shutil
+import subprocess
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 from main import app, get_media_duration, OUTPUT_DIR
@@ -16,6 +18,50 @@ client = TestClient(app)
 
 SAMPLE_VIDEO_URL = "https://media.nsketchai.com/videos/1769050552017-u9o0aq.mp4"
 SAMPLE_AUDIO_URL = "https://media.nsketchai.com/audiofiles/turnthelightsoff.mp3"
+
+
+def _run_command(cmd):
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def _create_png_frame(output_path, color):
+    _run_command([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"color=c={color}:s=64x64:d=0.04",
+        "-frames:v", "1",
+        str(output_path)
+    ])
+
+
+def _create_lossless_test_video(tmp_path, colors, filename):
+    frames_dir = tmp_path / f"{filename}_frames"
+    frames_dir.mkdir()
+
+    for index, color in enumerate(colors, start=1):
+        _create_png_frame(frames_dir / f"frame{index:02d}.png", color)
+
+    video_path = tmp_path / filename
+    _run_command([
+        "ffmpeg", "-y",
+        "-framerate", "1",
+        "-i", str(frames_dir / "frame%02d.png"),
+        "-c:v", "png",
+        "-pix_fmt", "rgb24",
+        str(video_path)
+    ])
+    return video_path, frames_dir
+
+
+def _decoded_md5(image_path):
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(image_path), "-f", "md5", "-"],
+        capture_output=True,
+        text=True
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
 
 
 class TestHealthEndpoint:
@@ -128,6 +174,96 @@ class TestDownloadEndpoint:
             output_path = merge_response.json().get("output_path")
             if output_path and os.path.exists(output_path):
                 os.remove(output_path)
+
+
+class TestExtractFifthFrameEndpoint:
+    def test_extract_fifth_frame_accepts_uploaded_file(self, tmp_path):
+        """Test extracting the fifth frame from a direct file upload."""
+        video_path, frames_dir = _create_lossless_test_video(
+            tmp_path,
+            ["red", "green", "blue", "yellow", "magenta"],
+            "uploaded_five_frame_source.mov"
+        )
+
+        with open(video_path, "rb") as video_handle:
+            response = client.post(
+                "/extract-fifth-frame",
+                data={"output_filename": "uploaded-preview"},
+                files={
+                    "video_file": (
+                        "uploaded_five_frame_source.mov",
+                        video_handle,
+                        "video/quicktime"
+                    )
+                },
+                headers=HEADERS
+            )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+        assert "filename=\"uploaded-preview.png\"" in response.headers["content-disposition"]
+
+        extracted_frame_path = tmp_path / "uploaded_extracted_frame.png"
+        extracted_frame_path.write_bytes(response.content)
+
+        expected_frame_path = frames_dir / "frame05.png"
+        assert _decoded_md5(extracted_frame_path) == _decoded_md5(expected_frame_path)
+
+    def test_extract_fifth_frame_returns_png(self, tmp_path, monkeypatch):
+        """Test extracting the fifth frame returns the expected PNG image."""
+        video_path, frames_dir = _create_lossless_test_video(
+            tmp_path,
+            ["red", "green", "blue", "yellow", "magenta"],
+            "five_frame_source.mov"
+        )
+
+        async def fake_download_file(_url, dest_path):
+            shutil.copyfile(video_path, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+
+        response = client.post(
+            "/extract-fifth-frame",
+            json={
+                "video_url": "https://example.com/five-frame-source.mov",
+                "output_filename": "preview"
+            },
+            headers=HEADERS
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "image/png"
+        assert "filename=\"preview.png\"" in response.headers["content-disposition"]
+
+        extracted_frame_path = tmp_path / "extracted_frame.png"
+        extracted_frame_path.write_bytes(response.content)
+
+        expected_frame_path = frames_dir / "frame05.png"
+        assert _decoded_md5(extracted_frame_path) == _decoded_md5(expected_frame_path)
+
+    def test_extract_fifth_frame_requires_at_least_five_frames(self, tmp_path, monkeypatch):
+        """Test extraction fails when the source video is shorter than five frames."""
+        video_path, _ = _create_lossless_test_video(
+            tmp_path,
+            ["red", "green", "blue", "yellow"],
+            "four_frame_source.mov"
+        )
+
+        async def fake_download_file(_url, dest_path):
+            shutil.copyfile(video_path, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+
+        response = client.post(
+            "/extract-fifth-frame",
+            json={"video_url": "https://example.com/four-frame-source.mov"},
+            headers=HEADERS
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "Video must contain at least 5 frames"
 
 
 class TestValidation:

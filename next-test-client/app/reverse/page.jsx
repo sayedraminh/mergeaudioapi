@@ -12,30 +12,12 @@ function extractFilename(path) {
   return parts[parts.length - 1] || "";
 }
 
-export default function MergePage() {
-  const [videoUrls, setVideoUrls] = useState(["", ""]);
-  const [audioUrl, setAudioUrl] = useState("");
+export default function ReversePage() {
+  const [videoUrl, setVideoUrl] = useState("");
   const [outputFilename, setOutputFilename] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [successData, setSuccessData] = useState(null);
-
-  function updateVideoUrl(index, value) {
-    setVideoUrls((prev) => {
-      const next = [...prev];
-      next[index] = value;
-      return next;
-    });
-  }
-
-  function addVideoField() {
-    setVideoUrls((prev) => [...prev, ""]);
-  }
-
-  function removeVideoField(index) {
-    if (videoUrls.length <= 1) return;
-    setVideoUrls((prev) => prev.filter((_, i) => i !== index));
-  }
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -43,28 +25,13 @@ export default function MergePage() {
     setErrorMessage("");
     setSuccessData(null);
 
-    const urls = videoUrls.map((u) => u.trim()).filter(Boolean);
-
-    if (urls.length === 0) {
-      setErrorMessage("At least one video URL is required.");
-      setIsSubmitting(false);
-      return;
-    }
-
-    if (!audioUrl.trim()) {
-      setErrorMessage("Audio URL is required.");
-      setIsSubmitting(false);
-      return;
-    }
-
     const payload = {
-      video_urls: urls,
-      audio_url: audioUrl.trim(),
+      video_url: videoUrl.trim(),
       output_filename: outputFilename.trim() || undefined
     };
 
     try {
-      const response = await fetch("/api/merge", {
+      const response = await fetch("/api/reverse", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
@@ -93,58 +60,29 @@ export default function MergePage() {
       <section className="card">
         <nav className="nav-links">
           <Link href="/">Beat Sync Tester</Link>
-          <span className="nav-active">Merge Tester</span>
+          <Link href="/merge">Merge Tester</Link>
           <Link href="/trim">Trim Tester</Link>
-          <Link href="/reverse">Reverse Tester</Link>
+          <span className="nav-active">Reverse Tester</span>
           <Link href="/speed">Speed Tester</Link>
           <Link href="/extract-fifth-frame">Frame Tester</Link>
         </nav>
 
-        <h1>Video Merge Tester</h1>
+        <h1>Reverse Video Tester</h1>
         <p>
-          Concatenate video clips and overlay an audio track. Proxies to the FastAPI
-          <code> /merge </code>
+          Reverse an entire video by URL. Proxies to the FastAPI
+          <code> /reverse </code>
           endpoint.
         </p>
 
         <form onSubmit={handleSubmit} className="form">
-          {videoUrls.map((url, index) => (
-            <label key={index}>
-              Video URL {index + 1}
-              <div style={{ display: "flex", gap: "8px" }}>
-                <input
-                  type="url"
-                  required
-                  value={url}
-                  onChange={(event) => updateVideoUrl(index, event.target.value)}
-                  placeholder={`https://.../video${index + 1}.mp4`}
-                  style={{ flex: 1 }}
-                />
-                {videoUrls.length > 1 ? (
-                  <button
-                    type="button"
-                    onClick={() => removeVideoField(index)}
-                    className="btn-secondary"
-                  >
-                    Remove
-                  </button>
-                ) : null}
-              </div>
-            </label>
-          ))}
-
-          <button type="button" onClick={addVideoField} className="btn-secondary">
-            + Add another video
-          </button>
-
           <label>
-            Audio URL
+            Video URL
             <input
               type="url"
               required
-              value={audioUrl}
-              onChange={(event) => setAudioUrl(event.target.value)}
-              placeholder="https://.../song.mp3"
+              value={videoUrl}
+              onChange={(event) => setVideoUrl(event.target.value)}
+              placeholder="https://.../video.mp4"
             />
           </label>
 
@@ -154,12 +92,12 @@ export default function MergePage() {
               type="text"
               value={outputFilename}
               onChange={(event) => setOutputFilename(event.target.value)}
-              placeholder="merged_output.mp4"
+              placeholder="reversed_output.mp4"
             />
           </label>
 
           <button type="submit" disabled={isSubmitting}>
-            {isSubmitting ? "Processing..." : "Merge Videos"}
+            {isSubmitting ? "Processing..." : "Reverse Video"}
           </button>
         </form>
 
@@ -168,11 +106,13 @@ export default function MergePage() {
         {successData ? (
           <div className="result">
             <p>{successData.message}</p>
+            <p>Original duration: {successData.original_duration_seconds}s</p>
+            <p>Result duration: {successData.transformed_duration_seconds}s</p>
             <p>Processing time: {successData.processing_time_seconds ?? "n/a"}s</p>
             <p>Delete after: {successData.delete_after_seconds}s</p>
             {successData.filename ? (
               <a href={`/api/download/${encodeURIComponent(successData.filename)}`}>
-                Download merged video
+                Download reversed video
               </a>
             ) : null}
           </div>
