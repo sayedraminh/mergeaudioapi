@@ -519,7 +519,7 @@ curl -O "http://localhost:8000/download/merged.mp4"
 ## Notes
 
 - **Audio handling:** Audio is automatically trimmed if longer than video, or padded with silence if shorter.
-- **Trim uses stream copy:** The `/trim` endpoint uses `-c copy` for near-instant trimming without re-encoding. Cuts may be slightly off from the exact timestamp due to keyframe alignment.
+- **Trim re-encodes:** The `/trim` endpoint re-encodes via `libx264` for frame-accurate cuts. This is slower than stream copy, but the output duration matches the requested trim much more closely.
 - **Auto-deletion:** Output files are automatically deleted after 120 seconds. Download immediately after processing.
 - **Concurrency:** Server supports up to 20 simultaneous requests.
 - **Supported formats:** MP4, MOV, AVI for video; MP3, WAV, AAC for audio.

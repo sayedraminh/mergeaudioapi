@@ -7,7 +7,15 @@ import shutil
 import subprocess
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
-from main import app, get_media_duration, OUTPUT_DIR, has_audio_stream
+from fastapi import HTTPException
+from main import (
+    DELETE_AFTER_SECONDS,
+    OUTPUT_DIR,
+    app,
+    get_media_duration,
+    has_audio_stream,
+    resolve_path_within_directory,
+)
 
 load_dotenv()
 
@@ -97,6 +105,26 @@ def _decoded_md5(image_path):
     return result.stdout.strip()
 
 
+def _mock_download_file(monkeypatch, source_path):
+    async def fake_download_file(_url, dest_path):
+        shutil.copyfile(source_path, dest_path)
+        return dest_path
+
+    monkeypatch.setattr("main.download_file", fake_download_file)
+
+
+def _assert_trimmed_output(data, expected_duration_seconds):
+    assert data["success"] is True
+    assert data["output_path"] is not None
+    assert os.path.exists(data["output_path"])
+    assert data["trimmed_duration_seconds"] == pytest.approx(expected_duration_seconds, abs=0.15)
+    assert get_media_duration(data["output_path"]) == pytest.approx(expected_duration_seconds, abs=0.15)
+    assert has_audio_stream(data["output_path"]) is True
+
+    if data["output_path"] and os.path.exists(data["output_path"]):
+        os.remove(data["output_path"])
+
+
 class TestHealthEndpoint:
     def test_health_check(self):
         """Test health check endpoint returns healthy status."""
@@ -117,7 +145,10 @@ class TestMergeEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["message"] == "Video and audio merged successfully"
+        assert data["message"] == (
+            f"Video and audio merged successfully. "
+            f"File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds."
+        )
         assert data["output_path"] is not None
         
         if data["output_path"] and os.path.exists(data["output_path"]):
@@ -184,6 +215,14 @@ class TestMergeEndpoint:
 
 
 class TestDownloadEndpoint:
+    def test_download_path_resolution_rejects_traversal(self):
+        """Traversal attempts must be rejected before reading outside OUTPUT_DIR."""
+        with pytest.raises(HTTPException) as exc_info:
+            resolve_path_within_directory(OUTPUT_DIR, "../.env")
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail == "Invalid filename"
+
     def test_download_nonexistent_file(self):
         """Test downloading a file that doesn't exist."""
         response = client.get("/download/nonexistent_file.mp4")
@@ -300,6 +339,28 @@ class TestExtractFifthFrameEndpoint:
 
 
 class TestTrimEndpoint:
+    def test_trim_from_only_keeps_trailing_segment(self, tmp_path, monkeypatch):
+        """trim_from should remove the requested prefix and keep the remainder."""
+        video_path = _create_testsrc_video(
+            tmp_path / "trim_from_source.mp4",
+            duration_seconds=3.0,
+            include_audio=True,
+        )
+        _mock_download_file(monkeypatch, video_path)
+
+        response = client.post(
+            "/trim",
+            json={
+                "video_url": "https://example.com/trim-from-source.mp4",
+                "trim_from": 1.0,
+                "output_filename": "trimmed-from.mp4",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200
+        _assert_trimmed_output(response.json(), expected_duration_seconds=2.0)
+
     def test_trim_to_is_frame_accurate_for_short_clips(self, tmp_path, monkeypatch):
         """trim_to should keep the requested leading duration rather than snapping to a later keyframe."""
         video_path = _create_testsrc_video(
@@ -307,12 +368,7 @@ class TestTrimEndpoint:
             duration_seconds=3.0,
             include_audio=True,
         )
-
-        async def fake_download_file(_url, dest_path):
-            shutil.copyfile(video_path, dest_path)
-            return dest_path
-
-        monkeypatch.setattr("main.download_file", fake_download_file)
+        _mock_download_file(monkeypatch, video_path)
 
         response = client.post(
             "/trim",
@@ -325,16 +381,106 @@ class TestTrimEndpoint:
         )
 
         assert response.status_code == 200
-        data = response.json()
-        assert data["success"] is True
-        assert data["trimmed_duration_seconds"] == pytest.approx(1.2, abs=0.15)
-        assert data["output_path"] is not None
-        assert os.path.exists(data["output_path"])
-        assert get_media_duration(data["output_path"]) == pytest.approx(1.2, abs=0.15)
-        assert has_audio_stream(data["output_path"]) is True
+        _assert_trimmed_output(response.json(), expected_duration_seconds=1.2)
 
-        if data["output_path"] and os.path.exists(data["output_path"]):
-            os.remove(data["output_path"])
+    def test_trim_range_extracts_requested_segment(self, tmp_path, monkeypatch):
+        """trim_from and trim_to together should extract the requested range."""
+        video_path = _create_testsrc_video(
+            tmp_path / "trim_range_source.mp4",
+            duration_seconds=3.0,
+            include_audio=True,
+        )
+        _mock_download_file(monkeypatch, video_path)
+
+        response = client.post(
+            "/trim",
+            json={
+                "video_url": "https://example.com/trim-range-source.mp4",
+                "trim_from": 0.5,
+                "trim_to": 1.75,
+                "output_filename": "trimmed-range.mp4",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200
+        _assert_trimmed_output(response.json(), expected_duration_seconds=1.25)
+
+    def test_trim_to_exceeding_duration_clamps_to_video_end(self, tmp_path, monkeypatch):
+        """trim_to beyond the source duration should clamp to the file end."""
+        video_path = _create_testsrc_video(
+            tmp_path / "trim_clamp_source.mp4",
+            duration_seconds=3.0,
+            include_audio=True,
+        )
+        _mock_download_file(monkeypatch, video_path)
+
+        response = client.post(
+            "/trim",
+            json={
+                "video_url": "https://example.com/trim-clamp-source.mp4",
+                "trim_to": 10.0,
+                "output_filename": "trimmed-clamped.mp4",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200
+        _assert_trimmed_output(response.json(), expected_duration_seconds=3.0)
+
+    def test_trim_requires_at_least_one_boundary(self):
+        """trim must reject requests that omit both trim_from and trim_to."""
+        response = client.post(
+            "/trim",
+            json={"video_url": "https://example.com/trim-source.mp4"},
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "At least one of trim_from or trim_to must be provided"
+
+    def test_trim_rejects_non_positive_trim_to(self, tmp_path, monkeypatch):
+        """trim_to must be strictly greater than zero."""
+        video_path = _create_testsrc_video(
+            tmp_path / "trim_invalid_to_source.mp4",
+            duration_seconds=3.0,
+            include_audio=True,
+        )
+        _mock_download_file(monkeypatch, video_path)
+
+        response = client.post(
+            "/trim",
+            json={
+                "video_url": "https://example.com/trim-invalid-to-source.mp4",
+                "trim_to": 0,
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "trim_to must be > 0"
+
+    def test_trim_rejects_trim_from_not_less_than_trim_to(self, tmp_path, monkeypatch):
+        """trim_from must be strictly less than trim_to when both are provided."""
+        video_path = _create_testsrc_video(
+            tmp_path / "trim_invalid_range_source.mp4",
+            duration_seconds=3.0,
+            include_audio=True,
+        )
+        _mock_download_file(monkeypatch, video_path)
+
+        response = client.post(
+            "/trim",
+            json={
+                "video_url": "https://example.com/trim-invalid-range-source.mp4",
+                "trim_from": 1.5,
+                "trim_to": 1.5,
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "trim_from must be less than trim_to"
 
 
 class TestValidation:
