@@ -31,7 +31,7 @@ Open `http://localhost:3000`.
 Available UI pages:
 - `/` beat-sync tester
 - `/merge` merge tester
-- `/trim` trim tester
+- `/trim` trim tester with inline preview plus requested-vs-actual duration stats
 - `/reverse` reverse tester
 - `/speed` speed/slow tester
 - `/extract-fifth-frame` fifth-frame PNG tester with URL and local file upload support
@@ -39,6 +39,7 @@ Available UI pages:
 ## 4) Notes
 
 - FastAPI output is auto-deleted after 120 seconds, so download quickly.
+- `/trim` now reflects the frame-accurate re-encode behavior for short cuts like `1.20`, `2.04`, `2.28`, and `3.25` seconds.
 - `video_cut_starts` can be either:
   - `2` values: one for video 1 and one for video 2.
   - `N` values: one per generated segment (`N = beat_timestamps.length`).

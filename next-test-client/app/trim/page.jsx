@@ -3,6 +3,8 @@
 import { useState } from "react";
 import Link from "next/link";
 
+const TRIM_TO_PRESETS = ["1.20", "2.04", "2.28", "3.25"];
+
 function extractFilename(path) {
   if (!path) {
     return "";
@@ -10,6 +12,14 @@ function extractFilename(path) {
 
   const parts = path.split(/[\\/]/g);
   return parts[parts.length - 1] || "";
+}
+
+function formatSeconds(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return "n/a";
+  }
+
+  return `${value.toFixed(2)}s`;
 }
 
 export default function TrimPage() {
@@ -94,13 +104,41 @@ export default function TrimPage() {
       }
 
       const filename = extractFilename(data.output_path) || payload.output_filename || "";
-      setSuccessData({ ...data, filename });
+      const requestedDuration =
+        typeof payload.trim_to === "number"
+          ? payload.trim_to - (typeof payload.trim_from === "number" ? payload.trim_from : 0)
+          : null;
+
+      setSuccessData({
+        ...data,
+        filename,
+        requested_duration_seconds: requestedDuration,
+        requested_trim_mode: trimMode,
+        requested_trim_from: payload.trim_from ?? null,
+        requested_trim_to: payload.trim_to ?? null
+      });
     } catch (error) {
       setErrorMessage(error.message || "Request failed");
     } finally {
       setIsSubmitting(false);
     }
   }
+
+  const trimmedDuration =
+    typeof successData?.trimmed_duration_seconds === "number"
+      ? successData.trimmed_duration_seconds
+      : null;
+  const requestedDuration =
+    typeof successData?.requested_duration_seconds === "number"
+      ? successData.requested_duration_seconds
+      : null;
+  const durationDelta =
+    trimmedDuration !== null && requestedDuration !== null
+      ? trimmedDuration - requestedDuration
+      : null;
+  const resultVideoHref = successData?.filename
+    ? `/api/download/${encodeURIComponent(successData.filename)}`
+    : null;
 
   return (
     <main className="container">
@@ -120,6 +158,15 @@ export default function TrimPage() {
           <code> /trim </code>
           endpoint.
         </p>
+        <div className="hint-panel">
+          <strong>Frame-accurate short trims are enabled.</strong>
+          <p>
+            This page is meant to verify exact cuts like <code>1.20</code>,
+            <code>2.04</code>, <code>2.28</code>, and <code>3.25</code> seconds.
+            After a response comes back, the tester shows the requested duration,
+            the actual output duration, and an inline video preview.
+          </p>
+        </div>
 
         <form onSubmit={handleSubmit} className="form">
           <label>
@@ -183,6 +230,24 @@ export default function TrimPage() {
             </label>
           ) : null}
 
+          {trimMode === "from_end" ? (
+            <div className="preset-row">
+              <span>Quick trim_to checks</span>
+              <div className="chip-row">
+                {TRIM_TO_PRESETS.map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    className="chip-button"
+                    onClick={() => setTrimTo(preset)}
+                  >
+                    {preset}s
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
           <label>
             Output Filename (optional)
             <input
@@ -203,12 +268,41 @@ export default function TrimPage() {
         {successData ? (
           <div className="result">
             <p>{successData.message}</p>
-            <p>Original duration: {successData.original_duration_seconds}s</p>
-            <p>Trimmed duration: {successData.trimmed_duration_seconds}s</p>
-            <p>Processing time: {successData.processing_time_seconds ?? "n/a"}s</p>
-            <p>Delete after: {successData.delete_after_seconds}s</p>
+            <div className="result-grid">
+              <div className="result-stat">
+                <span>Original duration</span>
+                <strong>{formatSeconds(successData.original_duration_seconds)}</strong>
+              </div>
+              <div className="result-stat">
+                <span>Requested duration</span>
+                <strong>{formatSeconds(requestedDuration)}</strong>
+              </div>
+              <div className="result-stat">
+                <span>Actual output</span>
+                <strong>{formatSeconds(trimmedDuration)}</strong>
+              </div>
+              <div className="result-stat">
+                <span>Duration delta</span>
+                <strong className={Math.abs(durationDelta ?? 0) <= 0.15 ? "delta-good" : "delta-warn"}>
+                  {durationDelta === null ? "n/a" : `${durationDelta >= 0 ? "+" : ""}${durationDelta.toFixed(2)}s`}
+                </strong>
+              </div>
+              <div className="result-stat">
+                <span>Processing time</span>
+                <strong>{formatSeconds(successData.processing_time_seconds)}</strong>
+              </div>
+              <div className="result-stat">
+                <span>Delete after</span>
+                <strong>{formatSeconds(successData.delete_after_seconds)}</strong>
+              </div>
+            </div>
+            {resultVideoHref ? (
+              <div className="result-video-shell">
+                <video className="video-preview" controls preload="metadata" src={resultVideoHref} />
+              </div>
+            ) : null}
             {successData.filename ? (
-              <a href={`/api/download/${encodeURIComponent(successData.filename)}`}>
+              <a href={resultVideoHref}>
                 Download trimmed video
               </a>
             ) : null}

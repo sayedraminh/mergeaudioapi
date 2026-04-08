@@ -160,6 +160,24 @@ def cleanup_files(file_paths: List[str]):
                 logger.error(f"Failed to delete temp file {file_path}: {e}")
 
 
+def resolve_path_within_directory(base_dir: str, filename: str) -> str:
+    """Resolve a filename inside a base directory and reject traversal attempts."""
+    resolved_base_dir = os.path.realpath(base_dir)
+    resolved_path = os.path.realpath(os.path.join(base_dir, filename))
+
+    try:
+        is_within_directory = (
+            os.path.commonpath([resolved_base_dir, resolved_path]) == resolved_base_dir
+        )
+    except ValueError:
+        is_within_directory = False
+
+    if not is_within_directory:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    return resolved_path
+
+
 async def save_uploaded_file(upload_file, dest_path: str) -> str:
     """Persist an uploaded file to a temporary location."""
     try:
@@ -769,21 +787,25 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
             await download_file(str(request.audio_url), audio_path)
             
             for i, vp in enumerate(video_paths):
-                vp_dur = get_media_duration(vp)
+                vp_dur = await asyncio.to_thread(get_media_duration, vp)
                 logger.info(f"Input clip {i} duration: {vp_dur}s — {vp}")
 
             concatenated_path = os.path.join(TEMP_DIR, f"concat_{session_id}.mp4")
             if len(video_paths) > 1:
-                concatenate_videos_reencoded(video_paths, concatenated_path)
+                await asyncio.to_thread(
+                    concatenate_videos_reencoded,
+                    video_paths,
+                    concatenated_path
+                )
             else:
                 concatenated_path = video_paths[0]
 
-            concat_dur = get_media_duration(concatenated_path)
+            concat_dur = await asyncio.to_thread(get_media_duration, concatenated_path)
             logger.info(f"Concatenated video duration: {concat_dur}s")
             
             output_filename = request.output_filename or f"output_{session_id}.mp4"
-            output_path = os.path.join(OUTPUT_DIR, output_filename)
-            merge_audio_video(concatenated_path, audio_path, output_path)
+            output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
+            await asyncio.to_thread(merge_audio_video, concatenated_path, audio_path, output_path)
             
             for vp in video_paths:
                 if os.path.exists(vp):
@@ -808,6 +830,8 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
                 processing_time_seconds=processing_time_seconds
             )
         
+        except HTTPException:
+            raise
         except httpx.HTTPError as e:
             raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
         except Exception as e:
@@ -874,15 +898,19 @@ async def merge_videos_with_beat_sync(
                 download_file(str(request.audio_url), audio_path)
             )
 
-            clip_durations = [
-                get_media_duration(downloaded_video_paths[0]),
-                get_media_duration(downloaded_video_paths[1])
-            ]
-            target_width, target_height = get_video_dimensions(downloaded_video_paths[0])
+            clip_durations = await asyncio.gather(
+                asyncio.to_thread(get_media_duration, downloaded_video_paths[0]),
+                asyncio.to_thread(get_media_duration, downloaded_video_paths[1]),
+            )
+            target_width, target_height = await asyncio.to_thread(
+                get_video_dimensions,
+                downloaded_video_paths[0]
+            )
 
             output_filename = request.output_filename or f"beat_sync_output_{session_id}.mp4"
-            output_path = os.path.join(OUTPUT_DIR, output_filename)
-            render_beat_sync_video(
+            output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
+            await asyncio.to_thread(
+                render_beat_sync_video,
                 video_paths=downloaded_video_paths,
                 audio_path=audio_path,
                 segment_durations=segment_durations,
@@ -937,11 +965,12 @@ def trim_video(input_path: str, output_path: str, trim_from: Optional[float], tr
     Returns (original_duration, trimmed_duration).
     """
     original_duration = get_media_duration(input_path)
+    include_audio = has_audio_stream(input_path)
 
     if trim_from is not None and trim_from < 0:
         raise ValueError("trim_from must be >= 0")
-    if trim_to is not None and trim_to < 0:
-        raise ValueError("trim_to must be >= 0")
+    if trim_to is not None and trim_to <= 0:
+        raise ValueError("trim_to must be > 0")
     if trim_from is not None and trim_to is not None and trim_from >= trim_to:
         raise ValueError("trim_from must be less than trim_to")
     if trim_from is not None and trim_from >= original_duration:
@@ -950,20 +979,37 @@ def trim_video(input_path: str, output_path: str, trim_from: Optional[float], tr
         logger.warning(f"trim_to ({trim_to}) exceeds video duration ({original_duration}), clamping to video end")
         trim_to = original_duration
 
-    cmd = ["ffmpeg", "-y"]
+    cmd = ["ffmpeg", "-y", "-i", input_path]
 
     if trim_from is not None:
+        # Place seek after input so ffmpeg decodes to the requested frame boundary.
         cmd += ["-ss", f"{trim_from:.6f}"]
 
-    cmd += ["-i", input_path]
-
     if trim_to is not None:
-        if trim_from is not None:
-            cmd += ["-t", f"{(trim_to - trim_from):.6f}"]
-        else:
-            cmd += ["-t", f"{trim_to:.6f}"]
+        duration = (trim_to - trim_from) if trim_from is not None else trim_to
+        cmd += ["-t", f"{duration:.6f}"]
 
-    cmd += ["-c", "copy", output_path]
+    if include_audio:
+        cmd += [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_path
+        ]
+    else:
+        cmd += [
+            "-an",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path
+        ]
 
     logger.info(f"Running trim ffmpeg command")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -1003,10 +1049,14 @@ async def trim_video_endpoint(request: TrimRequest, _: bool = Depends(verify_api
             await download_file(str(request.video_url), video_path)
 
             output_filename = request.output_filename or f"trimmed_{session_id}.mp4"
-            output_path = os.path.join(OUTPUT_DIR, output_filename)
+            output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
 
-            original_duration, trimmed_duration = trim_video(
-                video_path, output_path, request.trim_from, request.trim_to
+            original_duration, trimmed_duration = await asyncio.to_thread(
+                trim_video,
+                video_path,
+                output_path,
+                request.trim_from,
+                request.trim_to
             )
 
             schedule_file_deletion(output_path)
@@ -1052,11 +1102,11 @@ async def reverse_video_endpoint(request: ReverseRequest, _: bool = Depends(veri
             await download_file(str(request.video_url), video_path)
 
             output_filename = request.output_filename or f"reversed_{session_id}.mp4"
-            output_path = os.path.join(OUTPUT_DIR, output_filename)
+            output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
 
-            original_duration = get_media_duration(video_path)
-            reverse_video(video_path, output_path)
-            transformed_duration = get_media_duration(output_path)
+            original_duration = await asyncio.to_thread(get_media_duration, video_path)
+            await asyncio.to_thread(reverse_video, video_path, output_path)
+            transformed_duration = await asyncio.to_thread(get_media_duration, output_path)
             schedule_file_deletion(output_path)
 
             processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
@@ -1104,11 +1154,11 @@ async def speed_video_endpoint(request: SpeedRequest, _: bool = Depends(verify_a
 
             speed_token = f"{request.speed:.3f}".rstrip("0").rstrip(".").replace(".", "_")
             output_filename = request.output_filename or f"speed_{speed_token}x_{session_id}.mp4"
-            output_path = os.path.join(OUTPUT_DIR, output_filename)
+            output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
 
-            original_duration = get_media_duration(video_path)
-            change_video_speed(video_path, output_path, request.speed)
-            transformed_duration = get_media_duration(output_path)
+            original_duration = await asyncio.to_thread(get_media_duration, video_path)
+            await asyncio.to_thread(change_video_speed, video_path, output_path, request.speed)
+            transformed_duration = await asyncio.to_thread(get_media_duration, output_path)
             schedule_file_deletion(output_path)
 
             processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
@@ -1210,7 +1260,7 @@ async def extract_fifth_frame_endpoint(
                 await download_file(str(payload.video_url), video_path)
                 output_filename = payload.output_filename
 
-            extract_nth_frame(video_path, frame_path, frame_number=5)
+            await asyncio.to_thread(extract_nth_frame, video_path, frame_path, 5)
 
             output_filename = normalize_png_filename(
                 output_filename,
@@ -1244,7 +1294,7 @@ async def extract_fifth_frame_endpoint(
 @app.get("/download/{filename}")
 async def download_output(filename: str):
     """Download the merged output file."""
-    file_path = os.path.join(OUTPUT_DIR, filename)
+    file_path = resolve_path_within_directory(OUTPUT_DIR, filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(file_path, media_type="video/mp4", filename=filename)

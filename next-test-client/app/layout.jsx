@@ -2,7 +2,7 @@ import "./globals.css";
 
 export const metadata = {
   title: "Video API Tester",
-  description: "Test client for video merge, beat-sync, and trim endpoints"
+  description: "Test client for merge, beat-sync, frame-accurate trim, reverse, speed, and frame extraction endpoints"
 };
 
 export default function RootLayout({ children }) {
