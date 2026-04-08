@@ -149,6 +149,7 @@ POST /trim
 ```
 
 Trims a video clip by cutting from the start, from the end, or extracting a specific range.
+The trim endpoint re-encodes the output for frame-accurate short clips, so very small cuts such as `1.20` seconds do not drift to keyframe boundaries.
 
 **Headers:**
 | Header | Required | Description |

@@ -7,7 +7,7 @@ import shutil
 import subprocess
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
-from main import app, get_media_duration, OUTPUT_DIR
+from main import app, get_media_duration, OUTPUT_DIR, has_audio_stream
 
 load_dotenv()
 
@@ -52,6 +52,39 @@ def _create_lossless_test_video(tmp_path, colors, filename):
         str(video_path)
     ])
     return video_path, frames_dir
+
+
+def _create_testsrc_video(output_path, duration_seconds, include_audio=False):
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"testsrc=size=96x96:rate=30:duration={duration_seconds}",
+    ]
+
+    if include_audio:
+        cmd += [
+            "-f", "lavfi",
+            "-i", f"sine=frequency=1000:sample_rate=44100:duration={duration_seconds}",
+            "-shortest",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            str(output_path),
+        ]
+    else:
+        cmd += [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            str(output_path),
+        ]
+
+    _run_command(cmd)
+    return output_path
 
 
 def _decoded_md5(image_path):
@@ -264,6 +297,44 @@ class TestExtractFifthFrameEndpoint:
 
         assert response.status_code == 422
         assert response.json()["detail"] == "Video must contain at least 5 frames"
+
+
+class TestTrimEndpoint:
+    def test_trim_to_is_frame_accurate_for_short_clips(self, tmp_path, monkeypatch):
+        """trim_to should keep the requested leading duration rather than snapping to a later keyframe."""
+        video_path = _create_testsrc_video(
+            tmp_path / "trim_source.mp4",
+            duration_seconds=3.0,
+            include_audio=True,
+        )
+
+        async def fake_download_file(_url, dest_path):
+            shutil.copyfile(video_path, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+
+        response = client.post(
+            "/trim",
+            json={
+                "video_url": "https://example.com/trim-source.mp4",
+                "trim_to": 1.2,
+                "output_filename": "trimmed-short.mp4",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["trimmed_duration_seconds"] == pytest.approx(1.2, abs=0.15)
+        assert data["output_path"] is not None
+        assert os.path.exists(data["output_path"])
+        assert get_media_duration(data["output_path"]) == pytest.approx(1.2, abs=0.15)
+        assert has_audio_stream(data["output_path"]) is True
+
+        if data["output_path"] and os.path.exists(data["output_path"]):
+            os.remove(data["output_path"])
 
 
 class TestValidation:

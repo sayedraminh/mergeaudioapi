@@ -937,6 +937,7 @@ def trim_video(input_path: str, output_path: str, trim_from: Optional[float], tr
     Returns (original_duration, trimmed_duration).
     """
     original_duration = get_media_duration(input_path)
+    include_audio = has_audio_stream(input_path)
 
     if trim_from is not None and trim_from < 0:
         raise ValueError("trim_from must be >= 0")
@@ -950,20 +951,37 @@ def trim_video(input_path: str, output_path: str, trim_from: Optional[float], tr
         logger.warning(f"trim_to ({trim_to}) exceeds video duration ({original_duration}), clamping to video end")
         trim_to = original_duration
 
-    cmd = ["ffmpeg", "-y"]
+    cmd = ["ffmpeg", "-y", "-i", input_path]
 
     if trim_from is not None:
+        # Place seek after input so ffmpeg decodes to the requested frame boundary.
         cmd += ["-ss", f"{trim_from:.6f}"]
 
-    cmd += ["-i", input_path]
-
     if trim_to is not None:
-        if trim_from is not None:
-            cmd += ["-t", f"{(trim_to - trim_from):.6f}"]
-        else:
-            cmd += ["-t", f"{trim_to:.6f}"]
+        duration = (trim_to - trim_from) if trim_from is not None else trim_to
+        cmd += ["-t", f"{duration:.6f}"]
 
-    cmd += ["-c", "copy", output_path]
+    if include_audio:
+        cmd += [
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_path
+        ]
+    else:
+        cmd += [
+            "-an",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            output_path
+        ]
 
     logger.info(f"Running trim ffmpeg command")
     result = subprocess.run(cmd, capture_output=True, text=True)
