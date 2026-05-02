@@ -46,7 +46,10 @@ API_KEY=your-secret-api-key
 
 ## Railway Deployment
 
-This project includes `nixpacks.toml` so Railway installs the system FFmpeg package. That package provides both `ffmpeg` and `ffprobe`, which are required by the video endpoints.
+This project includes Railway build config so Railway installs the system FFmpeg package. That package provides both `ffmpeg` and `ffprobe`, which are required by the video endpoints.
+
+- `railpack.json` is used by Railway's default Railpack builder.
+- `nixpacks.toml` is kept for services configured to use the legacy Nixpacks builder.
 
 Set `API_KEY` in Railway variables, then redeploy the service. Railway provides the `PORT` environment variable used by the start command.
 
