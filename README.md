@@ -44,6 +44,12 @@ Create a `.env` file in the project root:
 API_KEY=your-secret-api-key
 ```
 
+## Railway Deployment
+
+This project includes `nixpacks.toml` so Railway installs the system FFmpeg package. That package provides both `ffmpeg` and `ffprobe`, which are required by the video endpoints.
+
+Set `API_KEY` in Railway variables, then redeploy the service. Railway provides the `PORT` environment variable used by the start command.
+
 ## Usage
 
 Start the server:
