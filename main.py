@@ -613,6 +613,15 @@ def normalize_png_filename(requested_filename: Optional[str], fallback_stem: str
     return f"{safe_stem}.png"
 
 
+def normalize_video_filename(requested_filename: Optional[str], fallback_filename: str) -> str:
+    """Return a video output filename with an extension ffmpeg can infer."""
+    filename = normalize_optional_text(requested_filename) or fallback_filename
+    _, extension = os.path.splitext(filename)
+    if extension:
+        return filename
+    return f"{filename}.mp4"
+
+
 def normalize_optional_text(value) -> Optional[str]:
     """Normalize optional form values to stripped strings or None."""
     if not isinstance(value, str):
@@ -803,7 +812,10 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
             concat_dur = await asyncio.to_thread(get_media_duration, concatenated_path)
             logger.info(f"Concatenated video duration: {concat_dur}s")
             
-            output_filename = request.output_filename or f"output_{session_id}.mp4"
+            output_filename = normalize_video_filename(
+                request.output_filename,
+                f"output_{session_id}.mp4"
+            )
             output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
             await asyncio.to_thread(merge_audio_video, concatenated_path, audio_path, output_path)
             
@@ -907,7 +919,10 @@ async def merge_videos_with_beat_sync(
                 downloaded_video_paths[0]
             )
 
-            output_filename = request.output_filename or f"beat_sync_output_{session_id}.mp4"
+            output_filename = normalize_video_filename(
+                request.output_filename,
+                f"beat_sync_output_{session_id}.mp4"
+            )
             output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
             await asyncio.to_thread(
                 render_beat_sync_video,
@@ -1048,7 +1063,10 @@ async def trim_video_endpoint(request: TrimRequest, _: bool = Depends(verify_api
             video_path = os.path.join(TEMP_DIR, f"trim_input_{session_id}{video_ext}")
             await download_file(str(request.video_url), video_path)
 
-            output_filename = request.output_filename or f"trimmed_{session_id}.mp4"
+            output_filename = normalize_video_filename(
+                request.output_filename,
+                f"trimmed_{session_id}.mp4"
+            )
             output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
 
             original_duration, trimmed_duration = await asyncio.to_thread(
@@ -1101,7 +1119,10 @@ async def reverse_video_endpoint(request: ReverseRequest, _: bool = Depends(veri
             video_path = os.path.join(TEMP_DIR, f"reverse_input_{session_id}{video_ext}")
             await download_file(str(request.video_url), video_path)
 
-            output_filename = request.output_filename or f"reversed_{session_id}.mp4"
+            output_filename = normalize_video_filename(
+                request.output_filename,
+                f"reversed_{session_id}.mp4"
+            )
             output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
 
             original_duration = await asyncio.to_thread(get_media_duration, video_path)
@@ -1153,7 +1174,10 @@ async def speed_video_endpoint(request: SpeedRequest, _: bool = Depends(verify_a
             await download_file(str(request.video_url), video_path)
 
             speed_token = f"{request.speed:.3f}".rstrip("0").rstrip(".").replace(".", "_")
-            output_filename = request.output_filename or f"speed_{speed_token}x_{session_id}.mp4"
+            output_filename = normalize_video_filename(
+                request.output_filename,
+                f"speed_{speed_token}x_{session_id}.mp4"
+            )
             output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
 
             original_duration = await asyncio.to_thread(get_media_duration, video_path)
