@@ -186,6 +186,42 @@ class TestMergeEndpoint:
         if data["output_path"] and os.path.exists(data["output_path"]):
             os.remove(data["output_path"])
 
+    def test_merge_multiple_videos_without_audio_preserves_source_audio(self, tmp_path, monkeypatch):
+        """Test concatenating videos without replacement audio keeps clip audio."""
+        first_video = _create_testsrc_video(tmp_path / "first.mp4", 0.6, include_audio=True)
+        second_video = _create_testsrc_video(tmp_path / "second.mp4", 0.6, include_audio=True)
+
+        async def fake_download_file(url, dest_path):
+            source = first_video if "first" in url else second_video
+            shutil.copyfile(source, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+        monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+
+        payload = {
+            "video_urls": [
+                "https://example.com/first.mp4",
+                "https://example.com/second.mp4",
+            ]
+        }
+        response = client.post("/merge", json=payload, headers=HEADERS)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["message"] == (
+            f"Videos merged successfully with source audio preserved. "
+            f"File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds."
+        )
+        assert data["output_path"] is not None
+        assert os.path.exists(data["output_path"])
+        assert has_audio_stream(data["output_path"]) is True
+        assert get_media_duration(data["output_path"]) == pytest.approx(1.2, abs=0.35)
+
+        if data["output_path"] and os.path.exists(data["output_path"]):
+            os.remove(data["output_path"])
+
     def test_merge_invalid_video_url(self):
         """Test merge with invalid video URL."""
         payload = {
@@ -495,9 +531,7 @@ class TestValidation:
 
     def test_missing_required_fields(self):
         """Test with missing required fields."""
-        payload = {
-            "video_urls": [SAMPLE_VIDEO_URL]
-        }
+        payload = {}
         response = client.post("/merge", json=payload, headers=HEADERS)
         assert response.status_code == 422
 

@@ -70,16 +70,17 @@ Server runs at `http://localhost:8000`
 GET /health
 ```
 
-### Merge Videos with Audio
+### Merge Videos with Optional Audio
 ```
 POST /merge
 Headers: X-API-Key: your-api-key
 Body: {
   "video_urls": ["https://example.com/video1.mp4"],
-  "audio_url": "https://example.com/audio.mp3",
+  "audio_url": "https://example.com/audio.mp3", // optional
   "output_filename": "output.mp4"
 }
 ```
+Omit `audio_url` to concatenate videos while preserving each clip's source audio.
 
 ### Beat-Synced Merge (Alternating 2 Clips)
 ```

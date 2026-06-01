@@ -57,7 +57,7 @@ POST /merge
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `video_urls` | array | Yes | List of video URLs to merge |
-| `audio_url` | string | Yes | URL of the audio file |
+| `audio_url` | string | No | Optional URL of the replacement audio file. Omit it to preserve each clip's source audio while concatenating. |
 | `output_filename` | string | No | Custom output filename (auto-generated if not provided) |
 
 **Success Response (200):**

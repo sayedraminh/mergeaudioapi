@@ -56,7 +56,7 @@ async def verify_api_key(x_api_key: str = Depends(api_key_header)):
 
 class MergeRequest(BaseModel):
     video_urls: List[HttpUrl]
-    audio_url: HttpUrl
+    audio_url: Optional[HttpUrl] = None
     output_filename: Optional[str] = None
 
 
@@ -336,6 +336,98 @@ def concatenate_videos_reencoded(video_paths: List[str], output_path: str) -> st
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise Exception(f"ffmpeg re-encoded concat error: {result.stderr}")
+
+    return output_path
+
+
+def concatenate_videos_preserving_audio(video_paths: List[str], output_path: str) -> str:
+    """
+    Concatenate videos while preserving each clip's audio.
+    Clips without audio receive silent audio for their own duration so concat stays aligned.
+    """
+    if not video_paths:
+        raise Exception("No video segments provided for concatenation")
+
+    target_width, target_height = get_video_dimensions(video_paths[0])
+
+    if len(video_paths) == 1:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_paths[0],
+            "-map", "0:v:0",
+            "-map", "0:a?",
+            "-vf",
+            (
+                f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
+                "fps=30,setsar=1,format=yuv420p"
+            ),
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"ffmpeg audio-preserving single-video render error: {result.stderr}")
+        return output_path
+
+    cmd = ["ffmpeg", "-y"]
+    for video_path in video_paths:
+        cmd += ["-i", video_path]
+
+    filter_parts = []
+    concat_inputs = []
+    for index, video_path in enumerate(video_paths):
+        clip_duration = get_media_duration(video_path)
+        filter_parts.append(
+            (
+                f"[{index}:v:0]"
+                f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+                f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
+                "fps=30,setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
+                f"[v{index}]"
+            )
+        )
+
+        if has_audio_stream(video_path):
+            filter_parts.append(
+                f"[{index}:a:0]aresample=48000,"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"apad,atrim=0:{clip_duration:.6f},"
+                f"asetpts=PTS-STARTPTS[a{index}]"
+            )
+        else:
+            filter_parts.append(
+                "anullsrc=channel_layout=stereo:sample_rate=48000,"
+                f"atrim=0:{clip_duration:.6f},asetpts=PTS-STARTPTS[a{index}]"
+            )
+
+        concat_inputs.append(f"[v{index}][a{index}]")
+
+    filter_parts.append(
+        f"{''.join(concat_inputs)}concat=n={len(video_paths)}:v=1:a=1[vout][aout]"
+    )
+
+    cmd += [
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"ffmpeg audio-preserving concat error: {result.stderr}")
 
     return output_path
 
@@ -771,17 +863,27 @@ def change_video_speed(input_path: str, output_path: str, speed: float) -> str:
 @app.post("/merge", response_model=MergeResponse)
 async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verify_api_key)):
     """
-    Merge multiple videos and add audio track.
+    Merge multiple videos and optionally add an audio track.
     
     - Downloads all video URLs and concatenates them
-    - Downloads audio and merges it with the concatenated video
-    - Audio is trimmed or padded based on video duration
+    - If audio_url is provided, downloads audio and merges it with the concatenated video
+    - If audio_url is omitted, concatenates videos while preserving each clip's source audio
+    - Provided audio is trimmed or padded based on video duration
     - Requires X-API-Key header for authentication
     """
     async with processing_semaphore:
         request_start_time = time.perf_counter()
         try:
-            logger.info(f"Received merge request with {len(request.video_urls)} video(s)")
+            logger.info(
+                f"Received merge request with {len(request.video_urls)} video(s); "
+                f"audio_url provided: {request.audio_url is not None}"
+            )
+            if not request.video_urls:
+                raise HTTPException(
+                    status_code=422,
+                    detail="video_urls must contain at least one video URL"
+                )
+
             session_id = uuid.uuid4().hex
             video_paths = []
             
@@ -791,52 +893,72 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
                 await download_file(str(video_url), video_path)
                 video_paths.append(video_path)
             
-            audio_ext = os.path.splitext(str(request.audio_url).split("?")[0])[1] or ".mp3"
-            audio_path = os.path.join(TEMP_DIR, f"audio_{session_id}{audio_ext}")
-            await download_file(str(request.audio_url), audio_path)
-            
             for i, vp in enumerate(video_paths):
                 vp_dur = await asyncio.to_thread(get_media_duration, vp)
                 logger.info(f"Input clip {i} duration: {vp_dur}s — {vp}")
 
-            concatenated_path = os.path.join(TEMP_DIR, f"concat_{session_id}.mp4")
-            if len(video_paths) > 1:
-                await asyncio.to_thread(
-                    concatenate_videos_reencoded,
-                    video_paths,
-                    concatenated_path
-                )
-            else:
-                concatenated_path = video_paths[0]
-
-            concat_dur = await asyncio.to_thread(get_media_duration, concatenated_path)
-            logger.info(f"Concatenated video duration: {concat_dur}s")
-            
             output_filename = normalize_video_filename(
                 request.output_filename,
                 f"output_{session_id}.mp4"
             )
             output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
-            await asyncio.to_thread(merge_audio_video, concatenated_path, audio_path, output_path)
+            audio_path: Optional[str] = None
+            concatenated_path: Optional[str] = None
+
+            if request.audio_url is not None:
+                audio_ext = os.path.splitext(str(request.audio_url).split("?")[0])[1] or ".mp3"
+                audio_path = os.path.join(TEMP_DIR, f"audio_{session_id}{audio_ext}")
+                await download_file(str(request.audio_url), audio_path)
+
+                concatenated_path = os.path.join(TEMP_DIR, f"concat_{session_id}.mp4")
+                if len(video_paths) > 1:
+                    await asyncio.to_thread(
+                        concatenate_videos_reencoded,
+                        video_paths,
+                        concatenated_path
+                    )
+                else:
+                    concatenated_path = video_paths[0]
+
+                concat_dur = await asyncio.to_thread(get_media_duration, concatenated_path)
+                logger.info(f"Concatenated video duration: {concat_dur}s")
+                await asyncio.to_thread(merge_audio_video, concatenated_path, audio_path, output_path)
+            else:
+                await asyncio.to_thread(
+                    concatenate_videos_preserving_audio,
+                    video_paths,
+                    output_path
+                )
+                concat_dur = await asyncio.to_thread(get_media_duration, output_path)
+                logger.info(f"Audio-preserving concatenated video duration: {concat_dur}s")
             
             for vp in video_paths:
                 if os.path.exists(vp):
                     os.remove(vp)
                     logger.info(f"Deleted temp video: {vp}")
-            if concatenated_path != video_paths[0] and os.path.exists(concatenated_path):
+            if (
+                concatenated_path
+                and concatenated_path != video_paths[0]
+                and os.path.exists(concatenated_path)
+            ):
                 os.remove(concatenated_path)
                 logger.info(f"Deleted concatenated temp: {concatenated_path}")
-            if os.path.exists(audio_path):
+            if audio_path and os.path.exists(audio_path):
                 os.remove(audio_path)
                 logger.info(f"Deleted temp audio: {audio_path}")
             
             schedule_file_deletion(output_path)
 
             processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
+            message = (
+                "Video and audio merged successfully."
+                if request.audio_url is not None
+                else "Videos merged successfully with source audio preserved."
+            )
             
             return MergeResponse(
                 success=True,
-                message=f"Video and audio merged successfully. File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds.",
+                message=f"{message} File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds.",
                 output_path=output_path,
                 delete_after_seconds=DELETE_AFTER_SECONDS,
                 processing_time_seconds=processing_time_seconds
