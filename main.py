@@ -24,7 +24,7 @@ from pydantic import BaseModel, HttpUrl, ValidationError
 from typing import List, Optional, Tuple
 
 DELETE_AFTER_SECONDS = 120
-MAX_CONCURRENT_JOBS = 20
+MAX_CONCURRENT_JOBS = 10
 MIN_SEGMENT_DURATION_SECONDS = 0.05
 
 API_KEY = os.getenv("API_KEY")
