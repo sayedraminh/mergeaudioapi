@@ -1,6 +1,7 @@
 import os
 import sys
 import uuid
+import json
 import subprocess
 import threading
 import asyncio
@@ -26,6 +27,10 @@ from typing import List, Optional, Tuple
 DELETE_AFTER_SECONDS = 120
 MAX_CONCURRENT_JOBS = 10
 MIN_SEGMENT_DURATION_SECONDS = 0.05
+MERGE_FRAME_RATE = 24
+LANDSCAPE_MERGE_CANVAS = (1920, 1080)
+PORTRAIT_MERGE_CANVAS = (1080, 1920)
+SQUARE_MERGE_CANVAS = (1080, 1080)
 
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
@@ -128,6 +133,62 @@ class SpeedResponse(VideoTransformResponse):
     speed: float
 
 
+class MediaProcessingError(Exception):
+    """A deterministic FFmpeg/ffprobe failure caused by the supplied media."""
+
+    def __init__(self, operation: str, stderr: str):
+        self.operation = operation
+        self.stderr = stderr
+        super().__init__(f"{operation} failed")
+
+    def public_detail(self) -> dict:
+        return {
+            "code": "media_processing_failed",
+            "message": f"{self.operation} failed",
+            "errors": relevant_media_error_lines(self.stderr),
+        }
+
+
+def relevant_media_error_lines(stderr: str, max_lines: int = 6) -> List[str]:
+    """Return a concise error tail without FFmpeg's banner or build configuration."""
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    signal_words = (
+        "error",
+        "failed",
+        "invalid",
+        "input link",
+        "could not",
+        "nothing was written",
+        "not found",
+    )
+    candidates = [
+        line for line in lines[-40:]
+        if any(signal in line.lower() for signal in signal_words)
+    ]
+    if not candidates:
+        candidates = lines[-max_lines:]
+
+    unique_candidates = list(dict.fromkeys(candidates))
+    if len(unique_candidates) > max_lines:
+        unique_candidates = [unique_candidates[0], *unique_candidates[-(max_lines - 1):]]
+    return [line[:500] for line in unique_candidates] or ["No error details were reported"]
+
+
+def raise_media_processing_error(
+    operation: str,
+    result: subprocess.CompletedProcess,
+) -> None:
+    """Log the complete tool error server-side, then raise a client-safe exception."""
+    stderr = result.stderr or ""
+    logger.error(
+        "%s failed with exit code %s. Full FFmpeg/ffprobe stderr:\n%s",
+        operation,
+        result.returncode,
+        stderr.rstrip(),
+    )
+    raise MediaProcessingError(operation, stderr)
+
+
 def schedule_file_deletion(file_path: str, delay_seconds: int = DELETE_AFTER_SECONDS):
     """Schedule a file to be deleted after a delay using a background thread."""
     def delete_after_delay():
@@ -158,6 +219,16 @@ def cleanup_files(file_paths: List[str]):
                 logger.info(f"Deleted temp file: {file_path}")
             except Exception as e:
                 logger.error(f"Failed to delete temp file {file_path}: {e}")
+
+
+def validate_rendered_output(output_path: str) -> None:
+    """Reject missing or empty FFmpeg outputs before returning them to a client."""
+    if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+        return
+
+    stderr = "FFmpeg produced a missing or zero-byte output file"
+    logger.error("Media processing failed. %s: %s", stderr, output_path)
+    raise MediaProcessingError("Media processing", stderr)
 
 
 def resolve_path_within_directory(base_dir: str, filename: str) -> str:
@@ -214,30 +285,98 @@ def get_media_duration(file_path: str) -> float:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise Exception(f"ffprobe error: {result.stderr}")
-    return float(result.stdout.strip())
+        raise_media_processing_error("Media validation", result)
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        stderr = f"ffprobe returned an invalid duration: {result.stdout.strip() or 'empty output'}"
+        logger.error("Media validation failed. %s", stderr)
+        raise MediaProcessingError("Media validation", stderr)
 
 
 def get_video_dimensions(file_path: str) -> Tuple[int, int]:
-    """Read first video stream dimensions with ffprobe."""
+    """Read first video stream's display dimensions, including 90-degree rotation."""
     cmd = [
         "ffprobe",
         "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "csv=p=0:s=x",
+        "-show_entries", "stream=width,height:stream_side_data=rotation",
+        "-of", "json",
         file_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise Exception(f"ffprobe stream error: {result.stderr}")
-    raw_dimensions = result.stdout.strip()
-    width_text, height_text = raw_dimensions.split("x")
-    width = int(width_text)
-    height = int(height_text)
+        raise_media_processing_error("Media validation", result)
+
+    try:
+        probe_data = json.loads(result.stdout)
+        stream = probe_data["streams"][0]
+        width = int(stream["width"])
+        height = int(stream["height"])
+        rotation = next(
+            (
+                float(side_data["rotation"])
+                for side_data in stream.get("side_data_list", [])
+                if "rotation" in side_data
+            ),
+            0.0,
+        )
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError, ValueError):
+        stderr = "ffprobe returned invalid video dimension metadata"
+        logger.error(
+            "Media validation failed. %s. Full ffprobe stdout:\n%s",
+            stderr,
+            result.stdout.rstrip(),
+        )
+        raise MediaProcessingError("Media validation", stderr)
+
     if width <= 0 or height <= 0:
-        raise Exception(f"Invalid video dimensions from ffprobe: {raw_dimensions}")
+        stderr = f"ffprobe returned invalid video dimensions: {width}x{height}"
+        logger.error("Media validation failed. %s", stderr)
+        raise MediaProcessingError("Media validation", stderr)
+
+    normalized_rotation = round(rotation) % 360
+    if normalized_rotation in (90, 270):
+        width, height = height, width
     return width, height
+
+
+def get_merge_target_canvas(file_path: str) -> Tuple[int, int]:
+    """Choose one canonical canvas for the request from its first clip's orientation."""
+    width, height = get_video_dimensions(file_path)
+    if width > height:
+        return LANDSCAPE_MERGE_CANVAS
+    if height > width:
+        return PORTRAIT_MERGE_CANVAS
+    return SQUARE_MERGE_CANVAS
+
+
+def build_video_normalization_chain(
+    target_width: int,
+    target_height: int,
+) -> str:
+    """Build the canonical scale, pad, and stream-normalization filter chain."""
+    return (
+        f"scale={target_width}:{target_height}:"
+        "force_original_aspect_ratio=decrease:force_divisible_by=2,"
+        f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
+        f"setsar=1,fps={MERGE_FRAME_RATE},format=yuv420p,"
+        "setpts=PTS-STARTPTS"
+    )
+
+
+def build_video_normalization_filter(
+    input_index: int,
+    target_width: int,
+    target_height: int,
+    output_label: str,
+) -> str:
+    """Label one canonical normalization chain for use in a filter graph."""
+    return (
+        f"[{input_index}:v:0]"
+        f"{build_video_normalization_chain(target_width, target_height)}"
+        f"[{output_label}]"
+    )
 
 
 def get_video_frame_count(file_path: str) -> Optional[int]:
@@ -277,7 +416,7 @@ def has_audio_stream(file_path: str) -> bool:
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise Exception(f"ffprobe audio stream error: {result.stderr}")
+        raise_media_processing_error("Media validation", result)
     return bool(result.stdout.strip())
 
 
@@ -309,9 +448,9 @@ def concatenate_videos(video_paths: List[str], output_path: str) -> str:
 
 def concatenate_videos_reencoded(video_paths: List[str], output_path: str) -> str:
     """
-    Concatenate videos using the filter_complex concat filter.
-    Each input is decoded independently so source timestamps are discarded,
-    preventing duration inflation from containers with non-zero start times.
+    Normalize every decoded video to one request canvas, then concatenate it.
+    Resetting source timestamps prevents duration inflation from containers with
+    non-zero start times.
     """
     if not video_paths:
         raise Exception("No video segments provided for concatenation")
@@ -320,22 +459,35 @@ def concatenate_videos_reencoded(video_paths: List[str], output_path: str) -> st
     for video_path in video_paths:
         cmd += ["-i", video_path]
 
+    target_width, target_height = get_merge_target_canvas(video_paths[0])
     n = len(video_paths)
-    filter_inputs = "".join(f"[{i}:v]" for i in range(n))
-    filter_complex = f"{filter_inputs}concat=n={n}:v=1:a=0[vout]"
+    filter_parts = [
+        build_video_normalization_filter(
+            input_index=index,
+            target_width=target_width,
+            target_height=target_height,
+            output_label=f"v{index}",
+        )
+        for index in range(n)
+    ]
+    filter_inputs = "".join(f"[v{index}]" for index in range(n))
+    filter_parts.append(f"{filter_inputs}concat=n={n}:v=1:a=0[vout]")
+    filter_complex = ";".join(filter_parts)
 
     cmd += [
         "-filter_complex", filter_complex,
         "-map", "[vout]",
+        "-an",
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
         "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
         output_path
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise Exception(f"ffmpeg re-encoded concat error: {result.stderr}")
+        raise_media_processing_error("Video normalization and concatenation", result)
 
     return output_path
 
@@ -348,7 +500,7 @@ def concatenate_videos_preserving_audio(video_paths: List[str], output_path: str
     if not video_paths:
         raise Exception("No video segments provided for concatenation")
 
-    target_width, target_height = get_video_dimensions(video_paths[0])
+    target_width, target_height = get_merge_target_canvas(video_paths[0])
 
     if len(video_paths) == 1:
         cmd = [
@@ -356,12 +508,7 @@ def concatenate_videos_preserving_audio(video_paths: List[str], output_path: str
             "-i", video_paths[0],
             "-map", "0:v:0",
             "-map", "0:a?",
-            "-vf",
-            (
-                f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
-                f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
-                "fps=30,setsar=1,format=yuv420p"
-            ),
+            "-vf", build_video_normalization_chain(target_width, target_height),
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-crf", "23",
@@ -372,7 +519,7 @@ def concatenate_videos_preserving_audio(video_paths: List[str], output_path: str
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            raise Exception(f"ffmpeg audio-preserving single-video render error: {result.stderr}")
+            raise_media_processing_error("Video normalization", result)
         return output_path
 
     cmd = ["ffmpeg", "-y"]
@@ -384,12 +531,11 @@ def concatenate_videos_preserving_audio(video_paths: List[str], output_path: str
     for index, video_path in enumerate(video_paths):
         clip_duration = get_media_duration(video_path)
         filter_parts.append(
-            (
-                f"[{index}:v:0]"
-                f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
-                f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2,"
-                "fps=30,setsar=1,format=yuv420p,setpts=PTS-STARTPTS"
-                f"[v{index}]"
+            build_video_normalization_filter(
+                input_index=index,
+                target_width=target_width,
+                target_height=target_height,
+                output_label=f"v{index}",
             )
         )
 
@@ -427,7 +573,7 @@ def concatenate_videos_preserving_audio(video_paths: List[str], output_path: str
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise Exception(f"ffmpeg audio-preserving concat error: {result.stderr}")
+        raise_media_processing_error("Video normalization and concatenation", result)
 
     return output_path
 
@@ -669,6 +815,7 @@ def merge_audio_video(video_path: str, audio_path: str, output_path: str) -> str
             "-c:a", "aac",
             "-b:a", "192k",
             "-t", str(video_duration),
+            "-movflags", "+faststart",
             output_path
         ]
     else:
@@ -684,6 +831,7 @@ def merge_audio_video(video_path: str, audio_path: str, output_path: str) -> str
             "-c:a", "aac",
             "-b:a", "192k",
             "-t", str(video_duration),
+            "-movflags", "+faststart",
             output_path
         ]
     
@@ -692,7 +840,7 @@ def merge_audio_video(video_path: str, audio_path: str, output_path: str) -> str
     logger.debug(f"ffmpeg stdout: {result.stdout}")
     logger.debug(f"ffmpeg stderr: {result.stderr}")
     if result.returncode != 0:
-        raise Exception(f"ffmpeg merge error: {result.stderr}")
+        raise_media_processing_error("Audio merge", result)
     
     return output_path
 
@@ -873,6 +1021,14 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
     """
     async with processing_semaphore:
         request_start_time = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        video_paths: List[str] = []
+        audio_path: Optional[str] = None
+        concatenated_path: Optional[str] = None
+        output_path: Optional[str] = None
+        output_write_started = False
+        succeeded = False
+
         try:
             logger.info(
                 f"Received merge request with {len(request.video_urls)} video(s); "
@@ -884,14 +1040,11 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
                     detail="video_urls must contain at least one video URL"
                 )
 
-            session_id = uuid.uuid4().hex
-            video_paths = []
-            
             for i, video_url in enumerate(request.video_urls):
                 video_ext = os.path.splitext(str(video_url).split("?")[0])[1] or ".mp4"
                 video_path = os.path.join(TEMP_DIR, f"video_{session_id}_{i}{video_ext}")
-                await download_file(str(video_url), video_path)
                 video_paths.append(video_path)
+                await download_file(str(video_url), video_path)
             
             for i, vp in enumerate(video_paths):
                 vp_dur = await asyncio.to_thread(get_media_duration, vp)
@@ -902,8 +1055,6 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
                 f"output_{session_id}.mp4"
             )
             output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
-            audio_path: Optional[str] = None
-            concatenated_path: Optional[str] = None
 
             if request.audio_url is not None:
                 audio_ext = os.path.splitext(str(request.audio_url).split("?")[0])[1] or ".mp3"
@@ -911,19 +1062,18 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
                 await download_file(str(request.audio_url), audio_path)
 
                 concatenated_path = os.path.join(TEMP_DIR, f"concat_{session_id}.mp4")
-                if len(video_paths) > 1:
-                    await asyncio.to_thread(
-                        concatenate_videos_reencoded,
-                        video_paths,
-                        concatenated_path
-                    )
-                else:
-                    concatenated_path = video_paths[0]
+                await asyncio.to_thread(
+                    concatenate_videos_reencoded,
+                    video_paths,
+                    concatenated_path
+                )
 
                 concat_dur = await asyncio.to_thread(get_media_duration, concatenated_path)
                 logger.info(f"Concatenated video duration: {concat_dur}s")
+                output_write_started = True
                 await asyncio.to_thread(merge_audio_video, concatenated_path, audio_path, output_path)
             else:
+                output_write_started = True
                 await asyncio.to_thread(
                     concatenate_videos_preserving_audio,
                     video_paths,
@@ -931,23 +1081,10 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
                 )
                 concat_dur = await asyncio.to_thread(get_media_duration, output_path)
                 logger.info(f"Audio-preserving concatenated video duration: {concat_dur}s")
-            
-            for vp in video_paths:
-                if os.path.exists(vp):
-                    os.remove(vp)
-                    logger.info(f"Deleted temp video: {vp}")
-            if (
-                concatenated_path
-                and concatenated_path != video_paths[0]
-                and os.path.exists(concatenated_path)
-            ):
-                os.remove(concatenated_path)
-                logger.info(f"Deleted concatenated temp: {concatenated_path}")
-            if audio_path and os.path.exists(audio_path):
-                os.remove(audio_path)
-                logger.info(f"Deleted temp audio: {audio_path}")
-            
+
+            validate_rendered_output(output_path)
             schedule_file_deletion(output_path)
+            succeeded = True
 
             processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
             message = (
@@ -963,13 +1100,19 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
                 delete_after_seconds=DELETE_AFTER_SECONDS,
                 processing_time_seconds=processing_time_seconds
             )
-        
+
+        except MediaProcessingError as e:
+            raise HTTPException(status_code=422, detail=e.public_detail())
         except HTTPException:
             raise
         except httpx.HTTPError as e:
             raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            cleanup_files([*video_paths, concatenated_path, audio_path])
+            if output_write_started and not succeeded and output_path:
+                cleanup_files([output_path])
 
 
 @app.post("/merge-beat-sync", response_model=BeatSyncMergeResponse)

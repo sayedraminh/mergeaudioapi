@@ -1,16 +1,19 @@
 import pytest
 import httpx
 import asyncio
+import json
 import os
 import tempfile
 import shutil
 import subprocess
+import uuid
 from dotenv import load_dotenv
 from fastapi.testclient import TestClient
 from fastapi import HTTPException
 from main import (
     DELETE_AFTER_SECONDS,
     OUTPUT_DIR,
+    TEMP_DIR,
     app,
     get_media_duration,
     has_audio_stream,
@@ -95,6 +98,90 @@ def _create_testsrc_video(output_path, duration_seconds, include_audio=False):
     return output_path
 
 
+def _create_colored_video(
+    output_path,
+    *,
+    color,
+    width,
+    height,
+    duration_seconds=5,
+    frame_rate=24,
+    profile="high",
+):
+    _run_command([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", (
+            f"color=c={color}:s={width}x{height}:"
+            f"r={frame_rate}:d={duration_seconds}"
+        ),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-profile:v", profile,
+        "-pix_fmt", "yuv420p",
+        str(output_path),
+    ])
+    return output_path
+
+
+def _create_audio_fixture(output_path, duration_seconds=10):
+    _run_command([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"sine=frequency=440:sample_rate=48000:duration={duration_seconds}",
+        "-c:a", "pcm_s16le",
+        str(output_path),
+    ])
+    return output_path
+
+
+def _add_display_rotation(input_path, output_path, rotation_degrees):
+    _run_command([
+        "ffmpeg", "-y",
+        "-display_rotation", str(rotation_degrees),
+        "-i", str(input_path),
+        "-c", "copy",
+        str(output_path),
+    ])
+    return output_path
+
+
+def _probe_media(file_path):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_streams",
+            "-show_format",
+            "-of", "json",
+            str(file_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def _sample_rgb(file_path, timestamp_seconds):
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "error",
+            "-ss", str(timestamp_seconds),
+            "-i", str(file_path),
+            "-frames:v", "1",
+            "-vf", "scale=1:1",
+            "-pix_fmt", "rgb24",
+            "-f", "rawvideo",
+            "pipe:1",
+        ],
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert len(result.stdout) >= 3
+    return tuple(result.stdout[:3])
+
+
 def _decoded_md5(image_path):
     result = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(image_path), "-f", "md5", "-"],
@@ -134,6 +221,166 @@ class TestHealthEndpoint:
 
 
 class TestMergeEndpoint:
+    def test_merge_normalizes_mismatched_video_dimensions(self, tmp_path, monkeypatch):
+        """Mismatched provider clips are normalized before concat."""
+        first_video = _create_colored_video(
+            tmp_path / "fixture-a.mp4",
+            color="red",
+            width=1924,
+            height=1076,
+            profile="main",
+        )
+        second_video = _create_colored_video(
+            tmp_path / "fixture-b.mp4",
+            color="blue",
+            width=1920,
+            height=1072,
+            profile="high",
+        )
+        audio = _create_audio_fixture(tmp_path / "soundtrack.wav")
+
+        async def fake_download_file(url, dest_path):
+            if "fixture-a" in url:
+                source = first_video
+            elif "fixture-b" in url:
+                source = second_video
+            else:
+                source = audio
+            shutil.copyfile(source, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+        monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+
+        output_filename = f"mismatched_{uuid.uuid4().hex}.mp4"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        temp_files_before = set(os.listdir(TEMP_DIR))
+        payload = {
+            "video_urls": [
+                "https://example.com/fixture-a.mp4",
+                "https://example.com/fixture-b.mp4",
+            ],
+            "audio_url": "https://example.com/soundtrack.wav",
+            "output_filename": output_filename,
+        }
+
+        try:
+            response = client.post("/merge", json=payload, headers=HEADERS)
+
+            assert response.status_code == 200, response.text
+            data = response.json()
+            assert data["success"] is True
+            assert data["output_path"] == output_path
+            assert os.path.exists(output_path)
+            assert os.path.getsize(output_path) > 0
+            assert set(os.listdir(TEMP_DIR)) == temp_files_before
+
+            probe = _probe_media(output_path)
+            video_stream = next(
+                stream for stream in probe["streams"] if stream["codec_type"] == "video"
+            )
+            audio_stream = next(
+                stream for stream in probe["streams"] if stream["codec_type"] == "audio"
+            )
+
+            assert float(probe["format"]["duration"]) == pytest.approx(10.0, abs=0.25)
+            assert (video_stream["width"], video_stream["height"]) == (1920, 1080)
+            assert video_stream["codec_name"] == "h264"
+            assert video_stream["sample_aspect_ratio"] == "1:1"
+            assert video_stream["pix_fmt"] == "yuv420p"
+            assert video_stream["avg_frame_rate"] == "24/1"
+            assert audio_stream["codec_name"] == "aac"
+
+            first_clip_rgb = _sample_rgb(output_path, 2.5)
+            second_clip_rgb = _sample_rgb(output_path, 7.5)
+            assert first_clip_rgb[0] > first_clip_rgb[2] + 100
+            assert second_clip_rgb[2] > second_clip_rgb[0] + 100
+        finally:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+    def test_merge_returns_422_and_cleans_up_for_invalid_media(self, tmp_path, monkeypatch):
+        """Deterministic media validation failures are concise and leave no artifacts."""
+        invalid_video = tmp_path / "invalid.mp4"
+        invalid_video.write_bytes(b"not an mp4")
+
+        async def fake_download_file(_url, dest_path):
+            shutil.copyfile(invalid_video, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+        monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+
+        output_filename = f"invalid_{uuid.uuid4().hex}.mp4"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
+        temp_files_before = set(os.listdir(TEMP_DIR))
+
+        response = client.post(
+            "/merge",
+            json={
+                "video_urls": ["https://example.com/invalid.mp4"],
+                "audio_url": "https://example.com/soundtrack.wav",
+                "output_filename": output_filename,
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "media_processing_failed"
+        assert response.json()["detail"]["message"] == "Media validation failed"
+        assert response.json()["detail"]["errors"]
+        assert "configuration:" not in response.text
+        assert set(os.listdir(TEMP_DIR)) == temp_files_before
+        assert not os.path.exists(output_path)
+
+    def test_merge_uses_portrait_canvas_for_rotated_clip(self, tmp_path, monkeypatch):
+        """Display rotation is included when deriving the request canvas."""
+        coded_landscape_video = _create_colored_video(
+            tmp_path / "coded-landscape.mp4",
+            color="green",
+            width=1920,
+            height=1080,
+            duration_seconds=1,
+        )
+        portrait_video = _add_display_rotation(
+            coded_landscape_video,
+            tmp_path / "portrait.mp4",
+            90,
+        )
+        audio = _create_audio_fixture(tmp_path / "portrait-audio.wav", duration_seconds=1)
+
+        async def fake_download_file(url, dest_path):
+            source = audio if "audio" in url else portrait_video
+            shutil.copyfile(source, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+        monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+
+        output_filename = f"portrait_{uuid.uuid4().hex}.mp4"
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
+
+        try:
+            response = client.post(
+                "/merge",
+                json={
+                    "video_urls": ["https://example.com/portrait.mp4"],
+                    "audio_url": "https://example.com/portrait-audio.wav",
+                    "output_filename": output_filename,
+                },
+                headers=HEADERS,
+            )
+
+            assert response.status_code == 200, response.text
+            probe = _probe_media(output_path)
+            video_stream = next(
+                stream for stream in probe["streams"] if stream["codec_type"] == "video"
+            )
+            assert (video_stream["width"], video_stream["height"]) == (1080, 1920)
+        finally:
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
     def test_merge_single_video_with_audio(self):
         """Test merging a single video with audio."""
         payload = {
