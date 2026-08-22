@@ -61,6 +61,7 @@ export default function ReversePage() {
         <nav className="nav-links">
           <Link href="/">Beat Sync Tester</Link>
           <Link href="/merge">Merge Tester</Link>
+          <Link href="/overlay">Overlay Tester</Link>
           <Link href="/trim">Trim Tester</Link>
           <span className="nav-active">Reverse Tester</span>
           <Link href="/speed">Speed Tester</Link>

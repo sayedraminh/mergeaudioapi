@@ -73,6 +73,20 @@ class MergeResponse(BaseModel):
     processing_time_seconds: Optional[float] = None
 
 
+class OverlayRequest(BaseModel):
+    base_video_url: HttpUrl
+    overlay_video_url: HttpUrl
+    x: int = 0
+    y: int = 0
+    overlay_width: Optional[int] = None
+    overlay_height: Optional[int] = None
+    output_filename: Optional[str] = None
+
+
+class OverlayResponse(MergeResponse):
+    base_duration_seconds: float
+
+
 class BeatSyncMergeRequest(BaseModel):
     video_urls: List[HttpUrl]
     audio_url: HttpUrl
@@ -845,6 +859,73 @@ def merge_audio_video(video_path: str, audio_path: str, output_path: str) -> str
     return output_path
 
 
+def overlay_video_layer(
+    base_video_path: str,
+    overlay_video_path: str,
+    output_path: str,
+    x: int = 0,
+    y: int = 0,
+    overlay_width: Optional[int] = None,
+    overlay_height: Optional[int] = None,
+) -> float:
+    """
+    Composite a video layer over a base video.
+
+    The base video controls the output duration, dimensions, and audio. The
+    overlay's audio is ignored. If the overlay ends first, the unobstructed base
+    continues for the rest of its duration.
+    """
+    if overlay_width is not None and overlay_width <= 0:
+        raise ValueError("overlay_width must be greater than 0")
+    if overlay_height is not None and overlay_height <= 0:
+        raise ValueError("overlay_height must be greater than 0")
+
+    base_duration = get_media_duration(base_video_path)
+    if base_duration <= 0:
+        raise ValueError("Base video duration must be greater than 0")
+
+    # Validate that the second input contains readable video before rendering.
+    get_video_dimensions(overlay_video_path)
+
+    overlay_filters = ["setpts=PTS-STARTPTS"]
+    if overlay_width is not None or overlay_height is not None:
+        target_width = str(overlay_width) if overlay_width is not None else "-2"
+        target_height = str(overlay_height) if overlay_height is not None else "-2"
+        overlay_filters.append(f"scale={target_width}:{target_height}")
+    # RGBA keeps an input alpha channel available to FFmpeg's overlay filter.
+    overlay_filters.append("format=rgba")
+
+    filter_complex = (
+        "[0:v:0]setpts=PTS-STARTPTS[base];"
+        f"[1:v:0]{','.join(overlay_filters)}[layer];"
+        f"[base][layer]overlay=x={x}:y={y}:"
+        "eof_action=pass:repeatlast=0:shortest=0:format=auto[vout]"
+    )
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", base_video_path,
+        "-i", overlay_video_path,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+        "-map", "0:a?",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-t", f"{base_duration:.6f}",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise_media_processing_error("Video overlay", result)
+
+    return base_duration
+
+
 def normalize_png_filename(requested_filename: Optional[str], fallback_stem: str) -> str:
     """Return a safe PNG filename for the extracted frame."""
     filename = os.path.basename(requested_filename) if requested_filename else fallback_stem
@@ -1111,6 +1192,112 @@ async def merge_videos_with_audio(request: MergeRequest, _: bool = Depends(verif
             raise HTTPException(status_code=500, detail=str(e))
         finally:
             cleanup_files([*video_paths, concatenated_path, audio_path])
+            if output_write_started and not succeeded and output_path:
+                cleanup_files([output_path])
+
+
+@app.post("/overlay", response_model=OverlayResponse)
+async def overlay_video_endpoint(
+    request: OverlayRequest,
+    _: bool = Depends(verify_api_key),
+):
+    """Composite one visual video layer over a base video."""
+    async with processing_semaphore:
+        request_start_time = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        base_video_path: Optional[str] = None
+        overlay_video_path: Optional[str] = None
+        output_path: Optional[str] = None
+        output_write_started = False
+        succeeded = False
+
+        try:
+            if request.overlay_width is not None and request.overlay_width <= 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="overlay_width must be greater than 0",
+                )
+            if request.overlay_height is not None and request.overlay_height <= 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="overlay_height must be greater than 0",
+                )
+
+            logger.info(
+                "Received video overlay request: position=(%s,%s), size=%sx%s",
+                request.x,
+                request.y,
+                request.overlay_width or "source",
+                request.overlay_height or "source",
+            )
+
+            base_ext = (
+                os.path.splitext(str(request.base_video_url).split("?")[0])[1]
+                or ".mp4"
+            )
+            overlay_ext = (
+                os.path.splitext(str(request.overlay_video_url).split("?")[0])[1]
+                or ".mp4"
+            )
+            base_video_path = os.path.join(
+                TEMP_DIR,
+                f"overlay_base_{session_id}{base_ext}",
+            )
+            overlay_video_path = os.path.join(
+                TEMP_DIR,
+                f"overlay_layer_{session_id}{overlay_ext}",
+            )
+
+            await asyncio.gather(
+                download_file(str(request.base_video_url), base_video_path),
+                download_file(str(request.overlay_video_url), overlay_video_path),
+            )
+
+            output_filename = normalize_video_filename(
+                request.output_filename,
+                f"overlay_output_{session_id}.mp4",
+            )
+            output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
+            output_write_started = True
+            base_duration = await asyncio.to_thread(
+                overlay_video_layer,
+                base_video_path,
+                overlay_video_path,
+                output_path,
+                request.x,
+                request.y,
+                request.overlay_width,
+                request.overlay_height,
+            )
+
+            validate_rendered_output(output_path)
+            schedule_file_deletion(output_path)
+            succeeded = True
+
+            processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
+            return OverlayResponse(
+                success=True,
+                message=(
+                    "Video layer added successfully. "
+                    f"File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds."
+                ),
+                output_path=output_path,
+                delete_after_seconds=DELETE_AFTER_SECONDS,
+                processing_time_seconds=processing_time_seconds,
+                base_duration_seconds=round(base_duration, 3),
+            )
+        except MediaProcessingError as e:
+            raise HTTPException(status_code=422, detail=e.public_detail())
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            cleanup_files([base_video_path, overlay_video_path])
             if output_write_started and not succeeded and output_path:
                 cleanup_files([output_path])
 

@@ -70,6 +70,7 @@ export default function SpeedPage() {
         <nav className="nav-links">
           <Link href="/">Beat Sync Tester</Link>
           <Link href="/merge">Merge Tester</Link>
+          <Link href="/overlay">Overlay Tester</Link>
           <Link href="/trim">Trim Tester</Link>
           <Link href="/reverse">Reverse Tester</Link>
           <span className="nav-active">Speed Tester</span>

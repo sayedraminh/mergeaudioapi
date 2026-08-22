@@ -6,6 +6,7 @@ A FastAPI server that merges multiple videos and adds an audio track with automa
 
 - Merge multiple video URLs into a single video
 - Add audio track to merged video
+- Composite a video layer over a base video (`/overlay`)
 - Beat-synced alternating merge for exactly 2 videos (`/merge-beat-sync`)
 - Trim videos (`/trim`)
 - Reverse videos (`/reverse`)
@@ -81,6 +82,26 @@ Body: {
 }
 ```
 Omit `audio_url` to concatenate videos while preserving each clip's source audio.
+
+### Add a Video Layer
+```
+POST /overlay
+Headers: X-API-Key: your-api-key
+Body: {
+  "base_video_url": "https://example.com/original.mp4",
+  "overlay_video_url": "https://example.com/layer.webm",
+  "x": 0,
+  "y": 0,
+  "overlay_width": 540,
+  "overlay_height": 960,
+  "output_filename": "layered.mp4"
+}
+```
+
+The base video controls the output dimensions, duration, and audio. The layer's
+audio is ignored, and transparent layer video formats remain transparent. Position
+and size fields are optional; by default the layer starts at the top-left at its
+source size. If the layer is shorter than the base, the base continues normally.
 
 ### Beat-Synced Merge (Alternating 2 Clips)
 ```
@@ -160,6 +181,7 @@ See [MERGE_API_DOCUMENTATION.md](MERGE_API_DOCUMENTATION.md) for full API docume
 
 Client integration handoff:
 - [CLIENT_SIDE_IMPLEMENTATION.md](CLIENT_SIDE_IMPLEMENTATION.md)
+- [CLIENT_SIDE_VIDEO_OVERLAY.md](CLIENT_SIDE_VIDEO_OVERLAY.md)
 - [CLIENT_SIDE_FRAME_EXTRACTION.md](CLIENT_SIDE_FRAME_EXTRACTION.md)
 - [next-test-client/README.md](next-test-client/README.md) (manual tester app)
 

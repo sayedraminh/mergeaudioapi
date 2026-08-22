@@ -10,7 +10,7 @@ http://localhost:8000
 
 ## Authentication
 
-All `POST /merge`, `POST /merge-beat-sync`, `POST /trim`, `POST /reverse`, `POST /speed`, and `POST /extract-fifth-frame` requests require an API key in the header:
+All `POST /merge`, `POST /overlay`, `POST /merge-beat-sync`, `POST /trim`, `POST /reverse`, `POST /speed`, and `POST /extract-fifth-frame` requests require an API key in the header:
 
 ```
 X-API-Key: your-api-key
@@ -75,6 +75,62 @@ POST /merge
 - `401` - Invalid or missing API key
 - `400` - Failed to download file
 - `422` - Validation error (invalid URL format, missing fields)
+- `500` - Server error
+
+---
+
+### Overlay a Video Layer
+
+```http
+POST /overlay
+```
+
+Composites one visual video layer over a base video. The base supplies the final
+dimensions, duration, and audio. The overlay's audio is ignored, while an overlay
+alpha channel is preserved during compositing.
+
+**Request Body:**
+```json
+{
+  "base_video_url": "https://example.com/original.mp4",
+  "overlay_video_url": "https://example.com/layer.webm",
+  "x": 0,
+  "y": 0,
+  "overlay_width": 540,
+  "overlay_height": 960,
+  "output_filename": "layered.mp4"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `base_video_url` | string | Yes | URL of the user's original video |
+| `overlay_video_url` | string | Yes | URL of the visual layer; its audio is ignored |
+| `x` | integer | No | Horizontal pixel position, default `0` |
+| `y` | integer | No | Vertical pixel position, default `0` |
+| `overlay_width` | positive integer | No | Rendered layer width; source width by default |
+| `overlay_height` | positive integer | No | Rendered layer height; source height by default |
+| `output_filename` | string | No | Custom output filename |
+
+Supplying only one dimension preserves the layer's aspect ratio. A shorter layer
+ends while the base continues; a longer layer is trimmed to the base duration.
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Video layer added successfully. File will be auto-deleted in 120 seconds.",
+  "output_path": "/path/to/output/layered.mp4",
+  "delete_after_seconds": 120,
+  "processing_time_seconds": 2.431,
+  "base_duration_seconds": 12.26
+}
+```
+
+**Error Responses:**
+- `400` - Failed to download a file
+- `401` - Invalid or missing API key
+- `422` - Invalid URL, media, or overlay dimensions
 - `500` - Server error
 
 ---

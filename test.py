@@ -182,6 +182,24 @@ def _sample_rgb(file_path, timestamp_seconds):
     return tuple(result.stdout[:3])
 
 
+def _sample_pixel_rgb(file_path, timestamp_seconds, x, y):
+    result = subprocess.run(
+        [
+            "ffmpeg", "-v", "error",
+            "-ss", str(timestamp_seconds),
+            "-i", str(file_path),
+            "-frames:v", "1",
+            "-vf", f"crop=1:1:{x}:{y},format=rgb24",
+            "-f", "rawvideo",
+            "pipe:1",
+        ],
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert len(result.stdout) >= 3
+    return tuple(result.stdout[:3])
+
+
 def _decoded_md5(image_path):
     result = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", str(image_path), "-f", "md5", "-"],
@@ -476,7 +494,7 @@ class TestMergeEndpoint:
             "audio_url": SAMPLE_AUDIO_URL
         }
         response = client.post("/merge", json=payload, headers=HEADERS)
-        assert response.status_code in [400, 500]
+        assert response.status_code in [400, 422, 500]
 
     def test_merge_invalid_audio_url(self):
         """Test merge with invalid audio URL."""
@@ -485,7 +503,7 @@ class TestMergeEndpoint:
             "audio_url": "https://invalid-url-that-does-not-exist.com/audio.mp3"
         }
         response = client.post("/merge", json=payload, headers=HEADERS)
-        assert response.status_code in [400, 500]
+        assert response.status_code in [400, 422, 500]
 
     def test_merge_empty_video_urls(self):
         """Test merge with empty video URLs list."""
@@ -619,6 +637,183 @@ class TestExtractFifthFrameEndpoint:
 
         assert response.status_code == 422
         assert response.json()["detail"] == "Video must contain at least 5 frames"
+
+
+class TestOverlayEndpoint:
+    def test_overlay_composites_layer_and_preserves_base_timeline_and_audio(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        base_video = tmp_path / "base.mp4"
+        _run_command([
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", "color=c=red:s=96x64:r=24:d=2",
+            "-f", "lavfi",
+            "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+            "-shortest",
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            str(base_video),
+        ])
+        overlay_video = _create_colored_video(
+            tmp_path / "layer.mp4",
+            color="blue",
+            width=32,
+            height=24,
+            duration_seconds=0.75,
+        )
+
+        async def fake_download_file(url, dest_path):
+            source = overlay_video if "layer" in url else base_video
+            shutil.copyfile(source, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+        monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+
+        output_filename = f"overlay_{uuid.uuid4().hex}.mp4"
+        response = client.post(
+            "/overlay",
+            json={
+                "base_video_url": "https://example.com/base.mp4",
+                "overlay_video_url": "https://example.com/layer.mp4",
+                "x": 16,
+                "y": 12,
+                "output_filename": output_filename,
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        output_path = data["output_path"]
+        try:
+            assert data["success"] is True
+            assert data["base_duration_seconds"] == pytest.approx(2, abs=0.1)
+            assert get_media_duration(output_path) == pytest.approx(2, abs=0.15)
+            assert has_audio_stream(output_path) is True
+
+            corner_during_overlay = _sample_pixel_rgb(output_path, 0.25, 4, 4)
+            center_during_overlay = _sample_pixel_rgb(output_path, 0.25, 20, 16)
+            center_after_overlay = _sample_pixel_rgb(output_path, 1.25, 20, 16)
+
+            assert corner_during_overlay[0] > 180
+            assert corner_during_overlay[2] < 80
+            assert center_during_overlay[2] > 180
+            assert center_during_overlay[0] < 80
+            assert center_after_overlay[0] > 180
+            assert center_after_overlay[2] < 80
+        finally:
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
+
+    def test_overlay_can_resize_layer(self, tmp_path, monkeypatch):
+        base_video = _create_colored_video(
+            tmp_path / "base.mp4",
+            color="red",
+            width=96,
+            height=64,
+            duration_seconds=1,
+        )
+        overlay_video = _create_colored_video(
+            tmp_path / "layer.mp4",
+            color="blue",
+            width=16,
+            height=16,
+            duration_seconds=1,
+        )
+
+        async def fake_download_file(url, dest_path):
+            source = overlay_video if "layer" in url else base_video
+            shutil.copyfile(source, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+        monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+
+        response = client.post(
+            "/overlay",
+            json={
+                "base_video_url": "https://example.com/base.mp4",
+                "overlay_video_url": "https://example.com/layer.mp4",
+                "overlay_width": 48,
+                "overlay_height": 32,
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200, response.text
+        output_path = response.json()["output_path"]
+        try:
+            inside_layer = _sample_pixel_rgb(output_path, 0.25, 40, 24)
+            outside_layer = _sample_pixel_rgb(output_path, 0.25, 70, 40)
+            assert inside_layer[2] > 180
+            assert outside_layer[0] > 180
+        finally:
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
+
+    def test_overlay_preserves_layer_transparency(self, tmp_path, monkeypatch):
+        base_video = _create_colored_video(
+            tmp_path / "base.mp4",
+            color="red",
+            width=64,
+            height=64,
+            duration_seconds=1,
+        )
+        overlay_video = tmp_path / "transparent-layer.mov"
+        _run_command([
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", "color=c=blue@0.5:s=64x64:r=24:d=1,format=rgba",
+            "-c:v", "qtrle",
+            "-pix_fmt", "argb",
+            str(overlay_video),
+        ])
+
+        async def fake_download_file(url, dest_path):
+            source = overlay_video if "layer" in url else base_video
+            shutil.copyfile(source, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+        monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+
+        response = client.post(
+            "/overlay",
+            json={
+                "base_video_url": "https://example.com/base.mp4",
+                "overlay_video_url": "https://example.com/layer.mov",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200, response.text
+        output_path = response.json()["output_path"]
+        try:
+            blended_pixel = _sample_pixel_rgb(output_path, 0.25, 20, 20)
+            assert blended_pixel[0] == pytest.approx(125, abs=30)
+            assert blended_pixel[2] == pytest.approx(125, abs=30)
+        finally:
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
+
+    def test_overlay_rejects_non_positive_dimensions(self):
+        response = client.post(
+            "/overlay",
+            json={
+                "base_video_url": "https://example.com/base.mp4",
+                "overlay_video_url": "https://example.com/layer.mp4",
+                "overlay_width": 0,
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "overlay_width must be greater than 0"
 
 
 class TestTrimEndpoint:

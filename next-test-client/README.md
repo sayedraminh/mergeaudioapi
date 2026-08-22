@@ -22,6 +22,7 @@ Open `http://localhost:3000`.
 
 - `POST /api/merge-beat-sync` proxies to FastAPI `/merge-beat-sync`.
 - `POST /api/merge` proxies to FastAPI `/merge`.
+- `POST /api/overlay` proxies to FastAPI `/overlay`.
 - `POST /api/trim` proxies to FastAPI `/trim`.
 - `POST /api/reverse` proxies to FastAPI `/reverse`.
 - `POST /api/speed` proxies to FastAPI `/speed`.
@@ -31,6 +32,7 @@ Open `http://localhost:3000`.
 Available UI pages:
 - `/` beat-sync tester
 - `/merge` merge tester
+- `/overlay` video-layer tester
 - `/trim` trim tester with inline preview plus requested-vs-actual duration stats
 - `/reverse` reverse tester
 - `/speed` speed/slow tester

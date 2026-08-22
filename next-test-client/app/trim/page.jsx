@@ -146,6 +146,7 @@ export default function TrimPage() {
         <nav className="nav-links">
           <Link href="/">Beat Sync Tester</Link>
           <Link href="/merge">Merge Tester</Link>
+          <Link href="/overlay">Overlay Tester</Link>
           <span className="nav-active">Trim Tester</span>
           <Link href="/reverse">Reverse Tester</Link>
           <Link href="/speed">Speed Tester</Link>
