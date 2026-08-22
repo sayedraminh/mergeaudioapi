@@ -85,7 +85,7 @@ export default function OverlayPage() {
         <h1>Video Layer Tester</h1>
         <p>
           Place a visual video layer over the user's original video. The result keeps
-          the original video's duration and audio.
+          the original video's dimensions, duration, and audio.
         </p>
 
         <form onSubmit={handleSubmit} className="form">
@@ -109,7 +109,10 @@ export default function OverlayPage() {
               onChange={(event) => setOverlayVideoUrl(event.target.value)}
               placeholder="https://.../layer.webm"
             />
-            <small>Transparent WebM or MOV layers are supported. Layer audio is ignored.</small>
+            <small>
+              Transparent WebM or MOV layers are supported. Leave both dimensions blank
+              to match the layer canvas to the base video. Layer audio is ignored.
+            </small>
           </label>
 
           <div className="result-grid">
@@ -128,7 +131,7 @@ export default function OverlayPage() {
                 min="1"
                 value={overlayWidth}
                 onChange={(event) => setOverlayWidth(event.target.value)}
-                placeholder="Source width"
+                placeholder="Match base width"
               />
             </label>
             <label>
@@ -138,7 +141,7 @@ export default function OverlayPage() {
                 min="1"
                 value={overlayHeight}
                 onChange={(event) => setOverlayHeight(event.target.value)}
-                placeholder="Source height"
+                placeholder="Match base height"
               />
             </label>
           </div>

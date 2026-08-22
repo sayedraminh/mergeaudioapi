@@ -873,7 +873,8 @@ def overlay_video_layer(
 
     The base video controls the output duration, dimensions, and audio. The
     overlay's audio is ignored. If the overlay ends first, the unobstructed base
-    continues for the rest of its duration.
+    continues for the rest of its duration. When no explicit layer dimensions
+    are supplied, the full overlay canvas is scaled to the base canvas.
     """
     if overlay_width is not None and overlay_width <= 0:
         raise ValueError("overlay_width must be greater than 0")
@@ -884,11 +885,14 @@ def overlay_video_layer(
     if base_duration <= 0:
         raise ValueError("Base video duration must be greater than 0")
 
+    base_width, base_height = get_video_dimensions(base_video_path)
     # Validate that the second input contains readable video before rendering.
     get_video_dimensions(overlay_video_path)
 
     overlay_filters = ["setpts=PTS-STARTPTS"]
-    if overlay_width is not None or overlay_height is not None:
+    if overlay_width is None and overlay_height is None:
+        overlay_filters.append(f"scale={base_width}:{base_height}")
+    else:
         target_width = str(overlay_width) if overlay_width is not None else "-2"
         target_height = str(overlay_height) if overlay_height is not None else "-2"
         overlay_filters.append(f"scale={target_width}:{target_height}")
@@ -1223,12 +1227,16 @@ async def overlay_video_endpoint(
                     detail="overlay_height must be greater than 0",
                 )
 
+            requested_size = (
+                "match-base"
+                if request.overlay_width is None and request.overlay_height is None
+                else f"{request.overlay_width or 'auto'}x{request.overlay_height or 'auto'}"
+            )
             logger.info(
-                "Received video overlay request: position=(%s,%s), size=%sx%s",
+                "Received video overlay request: position=(%s,%s), size=%s",
                 request.x,
                 request.y,
-                request.overlay_width or "source",
-                request.overlay_height or "source",
+                requested_size,
             )
 
             base_ext = (

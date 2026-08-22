@@ -92,16 +92,16 @@ Body: {
   "overlay_video_url": "https://example.com/layer.webm",
   "x": 0,
   "y": 0,
-  "overlay_width": 540,
-  "overlay_height": 960,
   "output_filename": "layered.mp4"
 }
 ```
 
 The base video controls the output dimensions, duration, and audio. The layer's
 audio is ignored, and transparent layer video formats remain transparent. Position
-and size fields are optional; by default the layer starts at the top-left at its
-source size. If the layer is shorter than the base, the base continues normally.
+and size fields are optional. By default, the server scales the full layer canvas
+to the base dimensions and places it at the top-left. This keeps a full-frame 9:16
+layer aligned across 720p, 1080p, 2K, and 4K base videos. If the layer is shorter
+than the base, the base continues normally.
 
 ### Beat-Synced Merge (Alternating 2 Clips)
 ```

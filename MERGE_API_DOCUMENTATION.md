@@ -96,8 +96,6 @@ alpha channel is preserved during compositing.
   "overlay_video_url": "https://example.com/layer.webm",
   "x": 0,
   "y": 0,
-  "overlay_width": 540,
-  "overlay_height": 960,
   "output_filename": "layered.mp4"
 }
 ```
@@ -108,12 +106,15 @@ alpha channel is preserved during compositing.
 | `overlay_video_url` | string | Yes | URL of the visual layer; its audio is ignored |
 | `x` | integer | No | Horizontal pixel position, default `0` |
 | `y` | integer | No | Vertical pixel position, default `0` |
-| `overlay_width` | positive integer | No | Rendered layer width; source width by default |
-| `overlay_height` | positive integer | No | Rendered layer height; source height by default |
+| `overlay_width` | positive integer | No | Rendered layer width; base width by default |
+| `overlay_height` | positive integer | No | Rendered layer height; base height by default |
 | `output_filename` | string | No | Custom output filename |
 
-Supplying only one dimension preserves the layer's aspect ratio. A shorter layer
-ends while the base continues; a longer layer is trimmed to the base duration.
+Omit both dimensions to scale a full-frame layer to the base canvas. This keeps
+the layer aligned across base videos with different resolutions and the same
+aspect ratio. Supplying only one dimension preserves the layer's aspect ratio.
+Supplying both uses exact pixel dimensions. A shorter layer ends while the base
+continues; a longer layer is trimmed to the base duration.
 
 **Success Response (200):**
 ```json

@@ -640,6 +640,62 @@ class TestExtractFifthFrameEndpoint:
 
 
 class TestOverlayEndpoint:
+    def test_overlay_matches_base_canvas_by_default_for_same_aspect_ratio(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        base_video = _create_colored_video(
+            tmp_path / "base.mp4",
+            color="red",
+            width=54,
+            height=96,
+            duration_seconds=1,
+        )
+        overlay_video = tmp_path / "full-frame-layer.mov"
+        _run_command([
+            "ffmpeg", "-y",
+            "-f", "lavfi",
+            "-i", (
+                "color=c=black@0:s=108x192:r=24:d=1,format=rgba,"
+                "drawbox=x=54:y=96:w=54:h=96:color=blue@1:t=fill:replace=1"
+            ),
+            "-c:v", "qtrle",
+            "-pix_fmt", "argb",
+            str(overlay_video),
+        ])
+
+        async def fake_download_file(url, dest_path):
+            source = overlay_video if "layer" in url else base_video
+            shutil.copyfile(source, dest_path)
+            return dest_path
+
+        monkeypatch.setattr("main.download_file", fake_download_file)
+        monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+
+        response = client.post(
+            "/overlay",
+            json={
+                "base_video_url": "https://example.com/base.mp4",
+                "overlay_video_url": "https://example.com/layer.mov",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200, response.text
+        output_path = response.json()["output_path"]
+        try:
+            transparent_quadrant = _sample_pixel_rgb(output_path, 0.25, 12, 24)
+            colored_quadrant = _sample_pixel_rgb(output_path, 0.25, 40, 72)
+
+            assert transparent_quadrant[0] > 180
+            assert transparent_quadrant[2] < 80
+            assert colored_quadrant[2] > 180
+            assert colored_quadrant[0] < 80
+        finally:
+            if output_path and os.path.exists(output_path):
+                os.remove(output_path)
+
     def test_overlay_composites_layer_and_preserves_base_timeline_and_audio(
         self,
         tmp_path,

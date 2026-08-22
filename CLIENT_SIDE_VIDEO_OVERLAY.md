@@ -18,8 +18,6 @@ X-API-Key: your-api-key
   "overlay_video_url": "https://example.com/layer.webm",
   "x": 0,
   "y": 0,
-  "overlay_width": 540,
-  "overlay_height": 960,
   "output_filename": "layered-video.mp4"
 }
 ```
@@ -32,13 +30,19 @@ Only `base_video_url` and `overlay_video_url` are required.
 | `overlay_video_url` | URL | required | The visual layer. Its audio is ignored. |
 | `x` | integer | `0` | Horizontal layer position in pixels. |
 | `y` | integer | `0` | Vertical layer position in pixels. |
-| `overlay_width` | positive integer | source width | Optional rendered layer width. |
-| `overlay_height` | positive integer | source height | Optional rendered layer height. |
+| `overlay_width` | positive integer | base width | Optional rendered layer width in pixels. |
+| `overlay_height` | positive integer | base height | Optional rendered layer height in pixels. |
 | `output_filename` | string | generated | Output filename; `.mp4` is added when omitted. |
 
-If only one layer dimension is provided, the other is calculated automatically
-to preserve the layer's aspect ratio. Negative `x` or `y` values are allowed and
-crop that part of the layer beyond the base frame.
+Omit both layer dimensions for a full-frame transparent overlay. The server
+scales the overlay canvas to the base canvas, so the overlay keeps the same
+relative placement on 720p, 1080p, 2K, and 4K 9:16 videos. Do not hardcode
+`540x960` for this case.
+
+If you provide one layer dimension, FFmpeg calculates the other to preserve the
+layer's aspect ratio. If you provide both, the server uses those exact pixel
+dimensions. Negative `x` or `y` values crop the part of the layer beyond the base
+frame.
 
 The base video determines the final canvas, timeline, and audio. Alpha channels
 in formats such as WebM or MOV are composited as transparency. If the layer is
