@@ -15,27 +15,40 @@ A FastAPI server that merges multiple videos and adds an audio track with automa
 - Automatic audio trimming/padding to match video duration
 - API key authentication
 - Auto-delete output files after 120 seconds
-- Supports 20 concurrent requests
+- Limits media processing to 10 concurrent jobs per server process
 
 ## Requirements
 
-- Python 3.8+
-- FFmpeg installed on system
+The production target is:
 
-## Installation
+- Ubuntu Server 26.04 LTS
+- Python 3.14
+- FFmpeg 8.x, with both `ffmpeg` and `ffprobe` on `PATH`
+- Writable `temp/` and `output/` directories with enough space for source and rendered media
+
+`requirements.txt` contains the pinned production dependency set. Test tools are
+kept in `requirements-dev.txt`.
+
+## Ubuntu installation
 
 ```bash
-# Clone the repository
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg
+
 git clone https://github.com/sayedraminh/mergeaudioapi.git
 cd mergeaudioapi
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python3 --version
+ffmpeg -version
+ffprobe -version
 
-# Install dependencies
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
+
+`python3 --version` should report Python 3.14.x. Ubuntu 26.04's `ffmpeg`
+package provides both FFmpeg commands used by this API.
 
 ## Configuration
 
@@ -45,7 +58,10 @@ Create a `.env` file in the project root:
 API_KEY=your-secret-api-key
 ```
 
-## Railway Deployment
+Set a non-empty `API_KEY` in production. The API runs without authentication
+when this variable is missing.
+
+## Railway deployment
 
 This project includes Railway build config so Railway installs the system FFmpeg package. That package provides both `ffmpeg` and `ffprobe`, which are required by the video endpoints.
 
@@ -54,24 +70,44 @@ This project includes Railway build config so Railway installs the system FFmpeg
 
 Set `API_KEY` in Railway variables, then redeploy the service. Railway provides the `PORT` environment variable used by the start command.
 
-## Usage
+## Run the server
 
-Start the server:
+Start one production process:
 
 ```bash
-uvicorn main:app --reload
+source .venv/bin/activate
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Server runs at `http://localhost:8000`
+Check it from the server:
 
-## API Endpoints
+```bash
+curl http://127.0.0.1:8000/health
+```
 
-### Health Check
+The response should be `{"status":"healthy"}`. Use a service manager such as
+systemd to restart the process and start it after reboot. Terminate HTTPS at a
+reverse proxy or load balancer. Use `uvicorn main:app --reload` only for local
+development.
+
+## Tests
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m pytest -q test.py
+```
+
+Some merge tests download remote fixture files and need outbound network access.
+
+## API endpoints
+
+### Health check
 ```
 GET /health
 ```
 
-### Merge Videos with Optional Audio
+### Merge videos with optional audio
 ```
 POST /merge
 Headers: X-API-Key: your-api-key
@@ -83,7 +119,7 @@ Body: {
 ```
 Omit `audio_url` to concatenate videos while preserving each clip's source audio.
 
-### Add a Video Layer
+### Add a video layer
 ```
 POST /overlay
 Headers: X-API-Key: your-api-key
@@ -103,7 +139,7 @@ to the base dimensions and places it at the top-left. This keeps a full-frame 9:
 layer aligned across 720p, 1080p, 2K, and 4K base videos. If the layer is shorter
 than the base, the base continues normally.
 
-### Beat-Synced Merge (Alternating 2 Clips)
+### Beat-synced merge for two alternating clips
 ```
 POST /merge-beat-sync
 Headers: X-API-Key: your-api-key
@@ -122,7 +158,7 @@ Body: {
 
 With beats `[4.2, 7.2, 10.2, 12.26]`, segment durations become `[4.2, 3.0, 3.0, 2.06]` and source clips alternate as `1,2,1,2`.
 
-### Trim Video
+### Trim video
 ```
 POST /trim
 Headers: X-API-Key: your-api-key
@@ -134,7 +170,7 @@ Body: {
 }
 ```
 
-### Reverse Video
+### Reverse video
 ```
 POST /reverse
 Headers: X-API-Key: your-api-key
@@ -144,7 +180,7 @@ Body: {
 }
 ```
 
-### Speed / Slow Video
+### Speed or slow video
 ```
 POST /speed
 Headers: X-API-Key: your-api-key
@@ -155,7 +191,7 @@ Body: {
 }
 ```
 
-### Extract the 5th Frame
+### Extract the 5th frame
 ```
 POST /extract-fifth-frame
 Headers: X-API-Key: your-api-key
@@ -170,7 +206,7 @@ The endpoint now supports either:
 - a remote `video_url` in JSON
 - or a multipart `video_file` upload for quick local testing
 
-### Download Output
+### Download output
 ```
 GET /download/{filename}
 ```
