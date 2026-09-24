@@ -380,6 +380,105 @@ Changes playback speed using a `speed` factor:
 
 ---
 
+### Strip Audio
+
+```http
+POST /strip-audio
+```
+
+Removes every audio track from a video. The video stream is copied without re-encoding, so quality and frame count are unchanged. A video that already has no audio still returns an output, with `had_audio: false`.
+
+**Headers:**
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-API-Key` | Yes | Your API key |
+| `Content-Type` | Yes | `application/json` |
+
+**Request Body:**
+```json
+{
+  "video_url": "https://example.com/clip.mp4",
+  "output_filename": "silent.mp4"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `video_url` | string | Yes | URL of the source video |
+| `output_filename` | string | No | Custom output filename |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Audio stripped successfully. File will be auto-deleted in 120 seconds.",
+  "output_path": "/path/to/output/silent.mp4",
+  "delete_after_seconds": 120,
+  "processing_time_seconds": 0.412,
+  "duration_seconds": 12.26,
+  "had_audio": true
+}
+```
+
+**Error Responses:**
+- `401` - Invalid or missing API key
+- `400` - Failed to download file
+- `422` - Validation error (invalid URL format, missing fields) or unreadable media
+- `500` - Server error
+
+---
+
+### Replace Audio
+
+```http
+POST /replace-audio
+```
+
+Replaces a video's audio with the first audio track of `audio_source_url`. The source can be an audio file (MP3, WAV, AAC, ...) or a video file, in which case only its audio is used. The video stream is copied without re-encoding; the new audio is encoded as AAC 192k. The output ends at whichever input is shorter.
+
+**Headers:**
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-API-Key` | Yes | Your API key |
+| `Content-Type` | Yes | `application/json` |
+
+**Request Body:**
+```json
+{
+  "video_url": "https://example.com/clip.mp4",
+  "audio_source_url": "https://example.com/other-clip.mp4",
+  "output_filename": "replaced_audio.mp4"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `video_url` | string | Yes | URL of the video whose picture is kept |
+| `audio_source_url` | string | Yes | URL of an audio or video file whose first audio track is used |
+| `output_filename` | string | No | Custom output filename |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Audio replaced successfully. File will be auto-deleted in 120 seconds.",
+  "output_path": "/path/to/output/replaced_audio.mp4",
+  "delete_after_seconds": 120,
+  "processing_time_seconds": 0.873,
+  "video_duration_seconds": 12.26,
+  "audio_duration_seconds": 30.0,
+  "output_duration_seconds": 12.26
+}
+```
+
+**Error Responses:**
+- `401` - Invalid or missing API key
+- `400` - Failed to download file
+- `422` - Validation error (`audio_source_url has no audio track`, invalid payload) or unreadable media
+- `500` - Server error
+
+---
+
 ### Extract the 5th Frame
 
 ```http
@@ -567,6 +666,15 @@ curl -X POST "http://localhost:8000/trim" \
     "trim_from": 1.07
   }'
 
+# Replace audio with the soundtrack of another clip
+curl -X POST "http://localhost:8000/replace-audio" \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "video_url": "https://example.com/clip.mp4",
+    "audio_source_url": "https://example.com/other-clip.mp4"
+  }'
+
 # Download result
 curl -O "http://localhost:8000/download/merged.mp4"
 ```
@@ -577,6 +685,7 @@ curl -O "http://localhost:8000/download/merged.mp4"
 
 - **Audio handling:** Audio is automatically trimmed if longer than video, or padded with silence if shorter.
 - **Trim re-encodes:** The `/trim` endpoint re-encodes via `libx264` for frame-accurate cuts. This is slower than stream copy, but the output duration matches the requested trim much more closely.
+- **No video re-encode for audio edits:** `/strip-audio` and `/replace-audio` copy the video stream as-is, so they are fast and lossless for the picture.
 - **Auto-deletion:** Output files are automatically deleted after 120 seconds. Download immediately after processing.
 - **Concurrency:** Server supports up to 20 simultaneous requests.
 - **Supported formats:** MP4, MOV, AVI for video; MP3, WAV, AAC for audio.

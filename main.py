@@ -147,6 +147,28 @@ class SpeedResponse(VideoTransformResponse):
     speed: float
 
 
+class StripAudioRequest(BaseModel):
+    video_url: HttpUrl
+    output_filename: Optional[str] = None
+
+
+class StripAudioResponse(MergeResponse):
+    duration_seconds: float
+    had_audio: bool
+
+
+class ReplaceAudioRequest(BaseModel):
+    video_url: HttpUrl
+    audio_source_url: HttpUrl
+    output_filename: Optional[str] = None
+
+
+class ReplaceAudioResponse(MergeResponse):
+    video_duration_seconds: float
+    audio_duration_seconds: float
+    output_duration_seconds: float
+
+
 class MediaProcessingError(Exception):
     """A deterministic FFmpeg/ffprobe failure caused by the supplied media."""
 
@@ -1672,6 +1694,172 @@ async def speed_video_endpoint(request: SpeedRequest, _: bool = Depends(verify_a
             if video_path and os.path.exists(video_path):
                 os.remove(video_path)
                 logger.info(f"Deleted temp speed input: {video_path}")
+
+
+def strip_audio_track(input_path: str, output_path: str) -> float:
+    """Remove every audio stream while stream-copying the first video stream. Returns output duration."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-map", "0:v:0",
+        "-c:v", "copy",
+        "-an",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise_media_processing_error("Audio strip", result)
+
+    validate_rendered_output(output_path)
+    return get_media_duration(output_path)
+
+
+def replace_audio_track(video_path: str, source_path: str, output_path: str) -> Tuple[float, float]:
+    """
+    Replace the video's audio with the first audio stream of source_path (audio or video file).
+    The video stream is copied; the output ends at the shorter of the two inputs.
+    Returns (video_duration, audio_duration).
+    """
+    if not has_audio_stream(source_path):
+        raise ValueError("audio_source_url has no audio track")
+
+    video_duration = get_media_duration(video_path)
+    audio_duration = get_media_duration(source_path)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", source_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise_media_processing_error("Audio replace", result)
+
+    validate_rendered_output(output_path)
+    return video_duration, audio_duration
+
+
+@app.post("/strip-audio", response_model=StripAudioResponse)
+async def strip_audio_endpoint(request: StripAudioRequest, _: bool = Depends(verify_api_key)):
+    """Remove the audio track from a video without re-encoding the video stream."""
+    async with processing_semaphore:
+        request_start_time = time.perf_counter()
+        video_path = None
+        try:
+            session_id = uuid.uuid4().hex
+
+            video_ext = os.path.splitext(str(request.video_url).split("?")[0])[1] or ".mp4"
+            video_path = os.path.join(TEMP_DIR, f"strip_input_{session_id}{video_ext}")
+            await download_file(str(request.video_url), video_path)
+
+            output_filename = normalize_video_filename(
+                request.output_filename,
+                f"stripped_{session_id}.mp4"
+            )
+            output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
+
+            had_audio = await asyncio.to_thread(has_audio_stream, video_path)
+            duration = await asyncio.to_thread(strip_audio_track, video_path, output_path)
+
+            schedule_file_deletion(output_path)
+
+            processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
+
+            return StripAudioResponse(
+                success=True,
+                message=f"Audio stripped successfully. File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds.",
+                output_path=output_path,
+                delete_after_seconds=DELETE_AFTER_SECONDS,
+                processing_time_seconds=processing_time_seconds,
+                duration_seconds=round(duration, 3),
+                had_audio=had_audio
+            )
+
+        except MediaProcessingError as e:
+            raise HTTPException(status_code=422, detail=e.public_detail())
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            cleanup_files([video_path])
+
+
+@app.post("/replace-audio", response_model=ReplaceAudioResponse)
+async def replace_audio_endpoint(request: ReplaceAudioRequest, _: bool = Depends(verify_api_key)):
+    """
+    Replace a video's audio with the first audio stream of another file (audio or video).
+    The video stream is copied without re-encoding; output ends at the shorter input.
+    """
+    async with processing_semaphore:
+        request_start_time = time.perf_counter()
+        video_path = None
+        source_path = None
+        try:
+            session_id = uuid.uuid4().hex
+
+            video_ext = os.path.splitext(str(request.video_url).split("?")[0])[1] or ".mp4"
+            video_path = os.path.join(TEMP_DIR, f"replace_video_{session_id}{video_ext}")
+            await download_file(str(request.video_url), video_path)
+
+            source_ext = os.path.splitext(str(request.audio_source_url).split("?")[0])[1] or ".mp4"
+            source_path = os.path.join(TEMP_DIR, f"replace_source_{session_id}{source_ext}")
+            await download_file(str(request.audio_source_url), source_path)
+
+            output_filename = normalize_video_filename(
+                request.output_filename,
+                f"replaced_audio_{session_id}.mp4"
+            )
+            output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
+
+            video_duration, audio_duration = await asyncio.to_thread(
+                replace_audio_track,
+                video_path,
+                source_path,
+                output_path
+            )
+            output_duration = await asyncio.to_thread(get_media_duration, output_path)
+
+            schedule_file_deletion(output_path)
+
+            processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
+
+            return ReplaceAudioResponse(
+                success=True,
+                message=f"Audio replaced successfully. File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds.",
+                output_path=output_path,
+                delete_after_seconds=DELETE_AFTER_SECONDS,
+                processing_time_seconds=processing_time_seconds,
+                video_duration_seconds=round(video_duration, 3),
+                audio_duration_seconds=round(audio_duration, 3),
+                output_duration_seconds=round(output_duration, 3)
+            )
+
+        except MediaProcessingError as e:
+            raise HTTPException(status_code=422, detail=e.public_detail())
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            cleanup_files([video_path, source_path])
 
 
 @app.post(

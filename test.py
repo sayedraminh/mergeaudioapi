@@ -1017,6 +1017,202 @@ class TestTrimEndpoint:
         assert response.json()["detail"] == "trim_from must be less than trim_to"
 
 
+def _stream_types(file_path):
+    return [stream["codec_type"] for stream in _probe_media(file_path)["streams"]]
+
+
+def _video_stream(file_path):
+    return next(s for s in _probe_media(file_path)["streams"] if s["codec_type"] == "video")
+
+
+def _count_video_frames(file_path):
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-count_frames",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=nb_read_frames",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(file_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return int(result.stdout.strip())
+
+
+def _mock_downloads_by_url(monkeypatch, sources):
+    async def fake_download_file(url, dest_path):
+        source = next(path for key, path in sources.items() if key in url)
+        shutil.copyfile(source, dest_path)
+        return dest_path
+
+    monkeypatch.setattr("main.download_file", fake_download_file)
+    monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+
+
+def _remove_output(data):
+    output_path = data.get("output_path")
+    if output_path and os.path.exists(output_path):
+        os.remove(output_path)
+
+
+class TestStripAudioEndpoint:
+    def test_strip_removes_audio_and_keeps_video_frames(self, tmp_path, monkeypatch):
+        """strip-audio should drop the audio stream and stream-copy every video frame."""
+        video_path = _create_testsrc_video(
+            tmp_path / "strip_source.mp4",
+            duration_seconds=2.0,
+            include_audio=True,
+        )
+        _mock_downloads_by_url(monkeypatch, {"strip-source": video_path})
+
+        response = client.post(
+            "/strip-audio",
+            json={
+                "video_url": "https://example.com/strip-source.mp4",
+                "output_filename": "stripped-test.mp4",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        try:
+            assert data["success"] is True
+            assert data["had_audio"] is True
+            assert data["delete_after_seconds"] == DELETE_AFTER_SECONDS
+            assert data["duration_seconds"] == pytest.approx(2.0, abs=0.15)
+            assert _stream_types(data["output_path"]) == ["video"]
+            assert _count_video_frames(data["output_path"]) == _count_video_frames(video_path)
+            assert _video_stream(data["output_path"])["codec_name"] == "h264"
+
+            download_response = client.get("/download/stripped-test.mp4")
+            assert download_response.status_code == 200
+            assert download_response.headers["content-type"] == "video/mp4"
+        finally:
+            _remove_output(data)
+
+    def test_strip_silent_input_reports_had_audio_false(self, tmp_path, monkeypatch):
+        """A video with no audio stream still produces an output with had_audio=false."""
+        video_path = _create_testsrc_video(
+            tmp_path / "silent_source.mp4",
+            duration_seconds=1.0,
+        )
+        _mock_downloads_by_url(monkeypatch, {"silent": video_path})
+
+        response = client.post(
+            "/strip-audio",
+            json={"video_url": "https://example.com/silent.mp4"},
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        try:
+            assert data["had_audio"] is False
+            assert os.path.exists(data["output_path"])
+            assert _stream_types(data["output_path"]) == ["video"]
+        finally:
+            _remove_output(data)
+
+
+class TestReplaceAudioEndpoint:
+    def test_replace_with_audio_file_source(self, tmp_path, monkeypatch):
+        """An audio file source replaces the video's audio; output ends at the shorter input."""
+        video_path = _create_testsrc_video(
+            tmp_path / "replace_video.mp4",
+            duration_seconds=2.0,
+            include_audio=True,
+        )
+        audio_path = _create_audio_fixture(tmp_path / "replace_audio.wav", duration_seconds=5)
+        _mock_downloads_by_url(monkeypatch, {"clip": video_path, "track": audio_path})
+
+        response = client.post(
+            "/replace-audio",
+            json={
+                "video_url": "https://example.com/clip.mp4",
+                "audio_source_url": "https://example.com/track.wav",
+                "output_filename": "replaced-audio-test.mp4",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        try:
+            assert data["success"] is True
+            assert data["video_duration_seconds"] == pytest.approx(2.0, abs=0.15)
+            assert data["audio_duration_seconds"] == pytest.approx(5.0, abs=0.15)
+            assert data["output_duration_seconds"] == pytest.approx(2.0, abs=0.15)
+
+            streams = _probe_media(data["output_path"])["streams"]
+            audio_streams = [s for s in streams if s["codec_type"] == "audio"]
+            assert len(audio_streams) == 1
+            assert audio_streams[0]["codec_name"] == "aac"
+            # The fixture's audio is 48 kHz; the original video audio was 44.1 kHz.
+            assert audio_streams[0]["sample_rate"] == "48000"
+            assert _video_stream(data["output_path"])["codec_name"] == "h264"
+            assert _count_video_frames(data["output_path"]) == _count_video_frames(video_path)
+
+            download_response = client.get("/download/replaced-audio-test.mp4")
+            assert download_response.status_code == 200
+            assert download_response.headers["content-type"] == "video/mp4"
+        finally:
+            _remove_output(data)
+
+    def test_replace_with_video_file_source_takes_its_audio(self, tmp_path, monkeypatch):
+        """A video file source contributes only its audio stream."""
+        video_path = _create_testsrc_video(tmp_path / "target.mp4", duration_seconds=2.0)
+        source_path = _create_testsrc_video(
+            tmp_path / "donor.mp4",
+            duration_seconds=3.0,
+            include_audio=True,
+        )
+        _mock_downloads_by_url(monkeypatch, {"target": video_path, "donor": source_path})
+
+        response = client.post(
+            "/replace-audio",
+            json={
+                "video_url": "https://example.com/target.mp4",
+                "audio_source_url": "https://example.com/donor.mp4?sig=abc",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 200, response.text
+        data = response.json()
+        try:
+            assert data["audio_duration_seconds"] == pytest.approx(3.0, abs=0.15)
+            assert data["output_duration_seconds"] == pytest.approx(2.0, abs=0.15)
+            assert sorted(_stream_types(data["output_path"])) == ["audio", "video"]
+            assert has_audio_stream(data["output_path"]) is True
+            assert _count_video_frames(data["output_path"]) == _count_video_frames(video_path)
+        finally:
+            _remove_output(data)
+
+    def test_replace_with_silent_source_returns_422(self, tmp_path, monkeypatch):
+        """A source without an audio stream is rejected as a validation error."""
+        video_path = _create_testsrc_video(tmp_path / "target.mp4", duration_seconds=1.0)
+        silent_source = _create_testsrc_video(tmp_path / "mute.mp4", duration_seconds=1.0)
+        _mock_downloads_by_url(monkeypatch, {"target": video_path, "mute": silent_source})
+
+        response = client.post(
+            "/replace-audio",
+            json={
+                "video_url": "https://example.com/target.mp4",
+                "audio_source_url": "https://example.com/mute.mp4",
+                "output_filename": "replace-silent-should-not-exist.mp4",
+            },
+            headers=HEADERS,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "audio_source_url has no audio track"
+        assert not os.path.exists(os.path.join(OUTPUT_DIR, "replace-silent-should-not-exist.mp4"))
+
+
 class TestValidation:
     def test_invalid_url_format(self):
         """Test with invalid URL format."""
