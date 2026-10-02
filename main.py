@@ -169,6 +169,24 @@ class ReplaceAudioResponse(MergeResponse):
     output_duration_seconds: float
 
 
+class ConcatClip(BaseModel):
+    video_url: HttpUrl
+    # Seconds kept from the start of the clip; omit to keep it whole.
+    duration: Optional[float] = None
+
+
+class ConcatRequest(BaseModel):
+    clips: List[ConcatClip]
+    # Optional file (audio or video) whose first audio track becomes the output's soundtrack.
+    audio_source_url: Optional[HttpUrl] = None
+    output_filename: Optional[str] = None
+
+
+class ConcatResponse(MergeResponse):
+    output_duration_seconds: float
+    has_audio: bool
+
+
 class MediaProcessingError(Exception):
     """A deterministic FFmpeg/ffprobe failure caused by the supplied media."""
 
@@ -1748,6 +1766,88 @@ def replace_audio_track(video_path: str, source_path: str, output_path: str) -> 
     return video_duration, audio_duration
 
 
+def get_video_frame_rate(file_path: str) -> Optional[float]:
+    """First video stream's average frame rate, or None when ffprobe cannot tell."""
+    cmd = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+        "-of", "json",
+        file_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    try:
+        stream = json.loads(result.stdout)["streams"][0]
+    except (json.JSONDecodeError, KeyError, IndexError):
+        return None
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        numerator, _, denominator = str(stream.get(key, "")).partition("/")
+        try:
+            rate = float(numerator) / float(denominator or 1)
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+        if 0 < rate <= 120:
+            return round(rate, 3)
+    return None
+
+
+def concatenate_clips_at_source_format(
+    video_paths: List[str],
+    durations: List[Optional[float]],
+    output_path: str,
+) -> str:
+    """
+    Join clips in order on the first clip's own canvas and frame rate, cutting
+    each to its duration in the same encode. Unlike /merge there is no fixed
+    1080p canvas, so parts of one render keep their resolution and aspect
+    ratio. Video only; the caller adds a soundtrack.
+    """
+    if not video_paths:
+        raise ValueError("clips must contain at least one clip")
+
+    width, height = get_video_dimensions(video_paths[0])
+    width -= width % 2
+    height -= height % 2
+    frame_rate = get_video_frame_rate(video_paths[0]) or MERGE_FRAME_RATE
+
+    cmd = ["ffmpeg", "-y"]
+    for video_path in video_paths:
+        cmd += ["-i", video_path]
+
+    filter_parts = []
+    for index, duration in enumerate(durations):
+        trim = f"trim=duration={duration:.6f}," if duration else ""
+        filter_parts.append(
+            f"[{index}:v:0]{trim}setpts=PTS-STARTPTS,"
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,"
+            f"setsar=1,fps={frame_rate},format=yuv420p[v{index}]"
+        )
+    filter_inputs = "".join(f"[v{index}]" for index in range(len(video_paths)))
+    filter_parts.append(f"{filter_inputs}concat=n={len(video_paths)}:v=1:a=0[vout]")
+
+    cmd += [
+        "-filter_complex", ";".join(filter_parts),
+        "-map", "[vout]",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise_media_processing_error("Clip concatenation", result)
+
+    validate_rendered_output(output_path)
+    return output_path
+
+
 @app.post("/strip-audio", response_model=StripAudioResponse)
 async def strip_audio_endpoint(request: StripAudioRequest, _: bool = Depends(verify_api_key)):
     """Remove the audio track from a video without re-encoding the video stream."""
@@ -1860,6 +1960,94 @@ async def replace_audio_endpoint(request: ReplaceAudioRequest, _: bool = Depends
             raise HTTPException(status_code=500, detail=str(e))
         finally:
             cleanup_files([video_path, source_path])
+
+
+@app.post("/concat", response_model=ConcatResponse)
+async def concat_clips_endpoint(request: ConcatRequest, _: bool = Depends(verify_api_key)):
+    """
+    Join clips in order, each optionally cut to a duration, keeping the first
+    clip's resolution and frame rate, then optionally lay the soundtrack of
+    audio_source_url over the result.
+
+    - Built for one render split into parts: each part is cut back to its
+      source length so the original soundtrack stays in sync.
+    - A source without an audio track gives a silent output (has_audio false).
+    - Requires X-API-Key header for authentication
+    """
+    async with processing_semaphore:
+        request_start_time = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        video_paths: List[str] = []
+        source_path: Optional[str] = None
+        joined_path: Optional[str] = None
+        output_path: Optional[str] = None
+        succeeded = False
+
+        try:
+            if not request.clips:
+                raise ValueError("clips must contain at least one clip")
+            for clip in request.clips:
+                if clip.duration is not None and clip.duration <= 0:
+                    raise ValueError("clip duration must be greater than 0")
+
+            for index, clip in enumerate(request.clips):
+                video_ext = os.path.splitext(str(clip.video_url).split("?")[0])[1] or ".mp4"
+                video_path = os.path.join(TEMP_DIR, f"concat_input_{session_id}_{index}{video_ext}")
+                video_paths.append(video_path)
+                await download_file(str(clip.video_url), video_path)
+
+            output_filename = normalize_video_filename(
+                request.output_filename,
+                f"concat_{session_id}.mp4"
+            )
+            output_path = resolve_path_within_directory(OUTPUT_DIR, output_filename)
+
+            has_audio = False
+            if request.audio_source_url is not None:
+                source_ext = os.path.splitext(str(request.audio_source_url).split("?")[0])[1] or ".mp4"
+                source_path = os.path.join(TEMP_DIR, f"concat_source_{session_id}{source_ext}")
+                await download_file(str(request.audio_source_url), source_path)
+                has_audio = await asyncio.to_thread(has_audio_stream, source_path)
+
+            joined_path = output_path if not has_audio else os.path.join(TEMP_DIR, f"concat_joined_{session_id}.mp4")
+            await asyncio.to_thread(
+                concatenate_clips_at_source_format,
+                video_paths,
+                [clip.duration for clip in request.clips],
+                joined_path
+            )
+            if has_audio:
+                await asyncio.to_thread(replace_audio_track, joined_path, source_path, output_path)
+
+            output_duration = await asyncio.to_thread(get_media_duration, output_path)
+            schedule_file_deletion(output_path)
+            succeeded = True
+
+            processing_time_seconds = round(time.perf_counter() - request_start_time, 3)
+            return ConcatResponse(
+                success=True,
+                message=f"Clips joined successfully. File will be auto-deleted in {DELETE_AFTER_SECONDS} seconds.",
+                output_path=output_path,
+                delete_after_seconds=DELETE_AFTER_SECONDS,
+                processing_time_seconds=processing_time_seconds,
+                output_duration_seconds=round(output_duration, 3),
+                has_audio=has_audio
+            )
+
+        except MediaProcessingError as e:
+            raise HTTPException(status_code=422, detail=e.public_detail())
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            cleanup_files([*video_paths, source_path, joined_path if joined_path != output_path else None])
+            if not succeeded and output_path:
+                cleanup_files([output_path])
 
 
 @app.post(

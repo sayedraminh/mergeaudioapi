@@ -479,6 +479,61 @@ Replaces a video's audio with the first audio track of `audio_source_url`. The s
 
 ---
 
+### Concatenate Clips
+
+```http
+POST /concat
+```
+
+Joins clips in order and can lay the soundtrack of another file over the result. Built for one render split into parts: each clip can be cut to a `duration` (seconds kept from its start), so parts that came back padded are trimmed to their source length and the original soundtrack stays in sync. Unlike `/merge`, the output keeps the first clip's own resolution and frame rate instead of a fixed 1080p canvas; other clips are scaled and padded to match. Video is encoded as H.264 (CRF 18); the soundtrack, when given, as AAC 192k.
+
+**Headers:**
+| Header | Required | Description |
+|--------|----------|-------------|
+| `X-API-Key` | Yes | Your API key |
+| `Content-Type` | Yes | `application/json` |
+
+**Request Body:**
+```json
+{
+  "clips": [
+    { "video_url": "https://example.com/part-1.mp4", "duration": 11.133 },
+    { "video_url": "https://example.com/part-2.mp4", "duration": 9.546 }
+  ],
+  "audio_source_url": "https://example.com/original.mov",
+  "output_filename": "joined.mp4"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `clips` | array | Yes | Clips in playback order (at least one) |
+| `clips[].video_url` | string | Yes | URL of the clip |
+| `clips[].duration` | number | No | Seconds kept from the clip's start; omit to keep it whole |
+| `audio_source_url` | string | No | Audio or video file whose first audio track becomes the soundtrack; a file without audio gives a silent output |
+| `output_filename` | string | No | Custom output filename |
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "Clips joined successfully. File will be auto-deleted in 120 seconds.",
+  "output_path": "/path/to/output/joined.mp4",
+  "delete_after_seconds": 120,
+  "processing_time_seconds": 3.42,
+  "output_duration_seconds": 20.679,
+  "has_audio": true
+}
+```
+
+**Error Responses:**
+- `401` - Invalid or missing API key
+- `400` - Failed to download file
+- `422` - Validation error (no clips, a duration of 0 or less, invalid payload) or unreadable media
+- `500` - Server error
+
+---
+
 ### Extract the 5th Frame
 
 ```http

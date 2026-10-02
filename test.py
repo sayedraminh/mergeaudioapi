@@ -1263,3 +1263,78 @@ def run_quick_test():
 
 if __name__ == "__main__":
     run_quick_test()
+
+
+class TestConcatEndpoint:
+    def test_concat_cuts_each_clip_and_keeps_the_source_format(self, tmp_path, monkeypatch):
+        """Parts of one render keep their resolution and frame rate and are cut back to their lengths."""
+        first = _create_colored_video(tmp_path / "part-a.mp4", color="red", width=720, height=1280, duration_seconds=4, frame_rate=30)
+        second = _create_colored_video(tmp_path / "part-b.mp4", color="blue", width=720, height=1280, duration_seconds=4, frame_rate=30)
+        _mock_downloads_by_url(monkeypatch, {"part-a": first, "part-b": second})
+
+        response = client.post("/concat", json={
+            "clips": [
+                {"video_url": "https://example.com/part-a.mp4", "duration": 3.4},
+                {"video_url": "https://example.com/part-b.mp4", "duration": 2.6},
+            ],
+        }, headers=HEADERS)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        try:
+            assert data["has_audio"] is False
+            assert data["output_duration_seconds"] == pytest.approx(6.0, abs=0.1)
+            video = _video_stream(data["output_path"])
+            assert (video["width"], video["height"]) == (720, 1280)
+            assert video["avg_frame_rate"] == "30/1"
+            assert _stream_types(data["output_path"]) == ["video"]
+            # The cut lands at 3.4 s: red just before it, blue just after.
+            assert _sample_rgb(data["output_path"], 3.2)[0] > 200
+            assert _sample_rgb(data["output_path"], 3.6)[2] > 200
+        finally:
+            _remove_output(data)
+
+    def test_concat_lays_the_source_soundtrack_over_the_joined_clips(self, tmp_path, monkeypatch):
+        first = _create_colored_video(tmp_path / "part-a.mp4", color="red", width=720, height=1280, duration_seconds=4, frame_rate=30)
+        second = _create_colored_video(tmp_path / "part-b.mp4", color="blue", width=720, height=1280, duration_seconds=4, frame_rate=30)
+        source = _create_testsrc_video(tmp_path / "source.mp4", 6, include_audio=True)
+        _mock_downloads_by_url(monkeypatch, {"part-a": first, "part-b": second, "source": source})
+
+        response = client.post("/concat", json={
+            "clips": [
+                {"video_url": "https://example.com/part-a.mp4", "duration": 3},
+                {"video_url": "https://example.com/part-b.mp4", "duration": 3},
+            ],
+            "audio_source_url": "https://example.com/source.mp4",
+        }, headers=HEADERS)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        try:
+            assert data["has_audio"] is True
+            assert data["output_duration_seconds"] == pytest.approx(6.0, abs=0.15)
+            assert sorted(_stream_types(data["output_path"])) == ["audio", "video"]
+            assert (_video_stream(data["output_path"])["width"], _video_stream(data["output_path"])["height"]) == (720, 1280)
+        finally:
+            _remove_output(data)
+
+    def test_concat_with_a_silent_source_gives_a_silent_video(self, tmp_path, monkeypatch):
+        first = _create_colored_video(tmp_path / "part-a.mp4", color="red", width=720, height=1280, duration_seconds=2, frame_rate=30)
+        silent = _create_colored_video(tmp_path / "silent-source.mp4", color="green", width=720, height=1280, duration_seconds=2, frame_rate=30)
+        _mock_downloads_by_url(monkeypatch, {"part-a": first, "silent-source": silent})
+
+        response = client.post("/concat", json={
+            "clips": [{"video_url": "https://example.com/part-a.mp4"}],
+            "audio_source_url": "https://example.com/silent-source.mp4",
+        }, headers=HEADERS)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        try:
+            assert data["has_audio"] is False
+            assert _stream_types(data["output_path"]) == ["video"]
+        finally:
+            _remove_output(data)
+
+    def test_concat_rejects_no_clips_and_bad_durations(self, monkeypatch):
+        monkeypatch.setattr("main.schedule_file_deletion", lambda *_args, **_kwargs: None)
+        assert client.post("/concat", json={"clips": []}, headers=HEADERS).status_code == 422
+        bad = {"clips": [{"video_url": "https://example.com/a.mp4", "duration": 0}]}
+        assert client.post("/concat", json=bad, headers=HEADERS).status_code == 422
