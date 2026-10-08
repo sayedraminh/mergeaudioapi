@@ -49,3 +49,18 @@ def test_cleanup_on_encode_failure(client,monkeypatch):
     def fail(_,path,*args):Path(path).write_bytes(b'partial');raise ValueError('bad audio')
     monkeypatch.setattr(main,'extract_source_audio',fail)
     assert post(c).status_code==422;assert not list(temp.iterdir());assert not list(output.iterdir());assert not scheduled
+
+
+def test_delayed_audio_keeps_leading_silence(client, tmp_path, monkeypatch):
+    c, _, _, _ = client
+    source = tmp_path / 'delayed.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=96x64:duration=3', '-itsoffset', '1', '-f', 'lavfi', '-i', 'sine=duration=2', '-c:v', 'libx264', '-c:a', 'aac', str(source)], check=True)
+    async def download(url, dest):
+        shutil.copyfile(source, dest)
+    monkeypatch.setattr(main, 'download_file', download)
+    response = post(c, start_seconds=0, end_seconds=3)
+    assert response.status_code == 200, response.text
+    with wave.open(response.json()['output_path'], 'rb') as wav:
+        samples = array('h', wav.readframes(wav.getnframes()))
+        assert max(abs(x) for x in samples[:38400]) == 0
+        assert max(abs(x) for x in samples[52800:62400]) > 1000

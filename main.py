@@ -1928,7 +1928,7 @@ def extract_source_audio(input_path: str, output_path: str, start: float, end: f
     duration = end - start
     result = subprocess.run([
         "ffmpeg", "-y", "-i", input_path, "-map", "0:a:0", "-vn",
-        "-af", f"atrim=start={start}:end={end},asetpts=PTS-STARTPTS,apad,atrim=duration={duration}",
+        "-af", f"aresample=48000:first_pts=0,atrim=start={start}:end={end},asetpts=PTS-STARTPTS,apad,atrim=duration={duration}",
         "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", output_path,
     ], capture_output=True, text=True)
     if result.returncode != 0:
