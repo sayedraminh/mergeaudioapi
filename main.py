@@ -7,6 +7,7 @@ import threading
 import asyncio
 import time
 import logging
+import math
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Depends, Request
@@ -21,7 +22,7 @@ logger = logging.getLogger("mergerapi")
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, HttpUrl, ValidationError
+from pydantic import BaseModel, HttpUrl, ValidationError, Field
 from typing import List, Optional, Tuple
 
 DELETE_AFTER_SECONDS = 120
@@ -155,6 +156,17 @@ class StripAudioRequest(BaseModel):
 class StripAudioResponse(MergeResponse):
     duration_seconds: float
     had_audio: bool
+
+
+class PrepareDepthRequest(BaseModel):
+    video_url: HttpUrl
+    source_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+
+class PrepareDepthResponse(MergeResponse):
+    original_duration_seconds: float
+    duration_seconds: float
+    grayscale: bool
 
 
 class ReplaceAudioRequest(BaseModel):
@@ -1712,6 +1724,59 @@ async def speed_video_endpoint(request: SpeedRequest, _: bool = Depends(verify_a
             if video_path and os.path.exists(video_path):
                 os.remove(video_path)
                 logger.info(f"Deleted temp speed input: {video_path}")
+
+
+def prepare_depth_video(input_path: str, output_path: str, target_duration: float) -> Tuple[float, float]:
+    """Retiming and color removal share one encode; retain spatial depth and motion."""
+    original_duration = get_media_duration(input_path)
+    if not math.isfinite(original_duration) or original_duration <= 0:
+        raise ValueError("Invalid depth video duration")
+    ratio = target_duration / original_duration
+    result = subprocess.run([
+        "ffmpeg", "-y", "-i", input_path, "-map", "0:v:0", "-an",
+        "-vf", f"setpts={ratio}*(PTS-STARTPTS),fps=30,hue=s=0",
+        "-t", str(target_duration), "-c:v", "libx264", "-preset", "fast",
+        "-crf", "20", "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path,
+    ], capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise_media_processing_error("Depth preparation", result)
+    validate_rendered_output(output_path)
+    duration = get_media_duration(output_path)
+    if not math.isfinite(duration) or abs(duration - target_duration) > 0.05:
+        raise ValueError("Prepared depth duration does not match the source")
+    return original_duration, duration
+
+
+@app.post("/prepare-depth", response_model=PrepareDepthResponse)
+async def prepare_depth_endpoint(request: PrepareDepthRequest, _: bool = Depends(verify_api_key)):
+    async with processing_semaphore:
+        started = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        video_path = os.path.join(TEMP_DIR, f"depth_input_{session_id}.mp4")
+        output_path = os.path.join(OUTPUT_DIR, f"depth_{session_id}.mp4")
+        completed = False
+        try:
+            await download_file(str(request.video_url), video_path)
+            original_duration, duration = await asyncio.to_thread(
+                prepare_depth_video, video_path, output_path, request.source_duration_seconds,
+            )
+            schedule_file_deletion(output_path)
+            completed = True
+            return PrepareDepthResponse(
+                success=True, message="Grayscale depth prepared successfully.",
+                output_path=output_path, processing_time_seconds=round(time.perf_counter() - started, 3),
+                original_duration_seconds=original_duration, duration_seconds=duration, grayscale=True,
+            )
+        except MediaProcessingError as error:
+            raise HTTPException(status_code=422, detail=error.public_detail())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+        except httpx.HTTPError:
+            raise HTTPException(status_code=400, detail="Failed to download depth video")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=422, detail="Depth preparation timed out")
+        finally:
+            cleanup_files([video_path, None if completed else output_path])
 
 
 def strip_audio_track(input_path: str, output_path: str) -> float:
