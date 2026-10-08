@@ -158,6 +158,17 @@ class StripAudioResponse(MergeResponse):
     had_audio: bool
 
 
+class ExtractAudioRequest(BaseModel):
+    video_url: HttpUrl
+    start_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
+    end_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+
+class ExtractAudioResponse(MergeResponse):
+    had_audio: bool
+    duration_seconds: float
+
+
 class PrepareDepthRequest(BaseModel):
     video_url: HttpUrl
     source_duration_seconds: float = Field(gt=0, allow_inf_nan=False)
@@ -1911,6 +1922,55 @@ def concatenate_clips_at_source_format(
 
     validate_rendered_output(output_path)
     return output_path
+
+
+def extract_source_audio(input_path: str, output_path: str, start: float, end: float) -> None:
+    duration = end - start
+    result = subprocess.run([
+        "ffmpeg", "-y", "-i", input_path, "-map", "0:a:0", "-vn",
+        "-af", f"atrim=start={start}:end={end},asetpts=PTS-STARTPTS,apad,atrim=duration={duration}",
+        "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", output_path,
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise_media_processing_error("Audio extraction", result)
+    validate_rendered_output(output_path)
+    if abs(get_media_duration(output_path) - duration) > 0.05:
+        raise ValueError("Extracted audio timing mismatch")
+
+
+@app.post("/extract-audio", response_model=ExtractAudioResponse)
+async def extract_audio_endpoint(request: ExtractAudioRequest, _: bool = Depends(verify_api_key)):
+    """Prepare an exact source interval as mono PCM WAV, without stretching speech."""
+    if request.end_seconds <= request.start_seconds or request.end_seconds - request.start_seconds > 30:
+        raise HTTPException(status_code=422, detail="Audio range must be positive and at most 30 seconds")
+    async with processing_semaphore:
+        source_path = output_path = None
+        started = time.perf_counter()
+        try:
+            session_id = uuid.uuid4().hex
+            source_path = os.path.join(TEMP_DIR, f"audio_input_{session_id}")
+            await download_file(str(request.video_url), source_path)
+            duration = await asyncio.to_thread(get_media_duration, source_path)
+            if request.start_seconds >= duration or request.end_seconds > duration + 0.05:
+                raise ValueError("Audio range exceeds source duration")
+            had_audio = await asyncio.to_thread(has_audio_stream, source_path)
+            if had_audio:
+                output_path = resolve_path_within_directory(OUTPUT_DIR, f"audio_{session_id}.wav")
+                await asyncio.to_thread(extract_source_audio, source_path, output_path, request.start_seconds, request.end_seconds)
+                schedule_file_deletion(output_path)
+            return ExtractAudioResponse(success=True, message="Source audio prepared" if had_audio else "Source has no audio", had_audio=had_audio, output_path=output_path,
+                duration_seconds=round(request.end_seconds - request.start_seconds, 6), processing_time_seconds=round(time.perf_counter() - started, 3))
+        except MediaProcessingError as e:
+            cleanup_files([output_path])
+            raise HTTPException(status_code=422, detail=e.public_detail())
+        except ValueError as e:
+            cleanup_files([output_path])
+            raise HTTPException(status_code=422, detail=str(e))
+        except Exception:
+            cleanup_files([output_path])
+            raise HTTPException(status_code=500, detail="Could not prepare source audio")
+        finally:
+            cleanup_files([source_path])
 
 
 @app.post("/strip-audio", response_model=StripAudioResponse)
