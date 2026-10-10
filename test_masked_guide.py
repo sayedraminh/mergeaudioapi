@@ -149,3 +149,18 @@ def test_composite_masks_offsets_later_zips_and_rejects_empty_masks(guide):
     response = client.post("/composite-masks", headers=HEADERS, json={**body, "mask_zips": [{"url": "https://example.com/empty.zip"}]})
     assert response.status_code == 422
     assert "no people" in response.text
+
+
+def test_guide_endpoints_refuse_playlists(guide):
+    client, files, tmp, temp = guide
+    playlist = tmp / "playlist.m3u8"
+    playlist.write_text("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nfile:///etc/passwd\n#EXT-X-ENDLIST\n")
+    files["https://example.com/p"] = playlist
+    for path, body in [
+        ("/normalize-video", {"video_url": "https://example.com/p"}),
+        ("/pitch-audio", {"audio_url": "https://example.com/p"}),
+    ]:
+        response = client.post(path, headers=HEADERS, json=body)
+        assert response.status_code == 422, response.text
+        assert "Unsupported media format" in response.text
+    assert list(temp.iterdir()) == []

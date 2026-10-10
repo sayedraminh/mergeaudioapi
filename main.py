@@ -2340,6 +2340,20 @@ class CompositeMasksResponse(MergeResponse):
     has_audio: bool
 
 
+# Demuxers that only read the downloaded bytes. Playlist-style formats (hls,
+# concat, ...) make FFmpeg open further URLs or local files, so they are refused.
+SAFE_MEDIA_FORMATS = {"mov", "mp4", "m4a", "3gp", "3g2", "mj2", "matroska", "webm", "wav", "mp3", "aac", "flac", "ogg"}
+
+
+def assert_safe_media(file_path: str) -> None:
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries", "format=format_name", "-of", "csv=p=0", file_path,
+    ], capture_output=True, text=True, timeout=60)
+    formats = set(result.stdout.strip().strip("\"").split(","))
+    if result.returncode != 0 or not formats <= SAFE_MEDIA_FORMATS:
+        raise ValueError("Unsupported media format")
+
+
 def probe_video_stream(file_path: str) -> dict:
     """Exact decoded frame count, size and frame rate of the first video stream."""
     result = subprocess.run([
@@ -2546,6 +2560,7 @@ async def normalize_video_endpoint(request: NormalizeVideoRequest, _: bool = Dep
         completed = False
         try:
             await download_file(str(request.video_url), input_path)
+            await asyncio.to_thread(assert_safe_media, input_path)
             meta = await asyncio.to_thread(
                 normalize_guide_video, input_path, output_path, request.start_seconds,
                 request.end_seconds, request.fps, request.max_dimension,
@@ -2581,6 +2596,7 @@ async def pitch_audio_endpoint(request: PitchAudioRequest, _: bool = Depends(ver
         completed = False
         try:
             await download_file(str(request.audio_url), input_path)
+            await asyncio.to_thread(assert_safe_media, input_path)
             duration, engine = await asyncio.to_thread(pitch_shift_audio, input_path, output_path, request.semitones)
             schedule_file_deletion(output_path)
             completed = True
@@ -2623,6 +2639,9 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
             if audio_path:
                 downloads.append(download_file(str(request.audio_url), audio_path))
             await asyncio.gather(*downloads)
+            for path in [video_path, depth_path, audio_path]:
+                if path:
+                    await asyncio.to_thread(assert_safe_media, path)
             frames = (await asyncio.to_thread(probe_video_stream, video_path))["frames"]
             if not frames or frames > GUIDE_MAX_FRAMES:
                 raise ValueError("Normalized video frame count is out of range")
