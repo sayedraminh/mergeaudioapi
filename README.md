@@ -313,7 +313,7 @@ The worker runs in its own environment so MediaPipe and OpenCV stay out of the
 API's dependencies. Install it once per server:
 
 ```bash
-sudo apt install -y libgl1 libglib2.0-0 libportaudio2
+sudo apt install -y libgl1 libglib2.0-0
 bash setup-face-mesh.sh
 ```
 

@@ -13,10 +13,16 @@ import argparse
 import json
 import subprocess
 import sys
+import types
 
-import cv2
-import mediapipe as mp
-import numpy as np
+# MediaPipe imports sounddevice for its microphone tasks, and sounddevice starts
+# PortAudio on import, which fails on a server with no audio system. The face
+# mesh never records audio, so an empty module stands in for it.
+sys.modules.setdefault("sounddevice", types.ModuleType("sounddevice"))
+
+import cv2  # noqa: E402
+import mediapipe as mp  # noqa: E402
+import numpy as np  # noqa: E402
 
 # RGB: frames are decoded as rgb24.
 TESSELATION = (50, 170, 205)
@@ -48,6 +54,9 @@ def reader(path, width, height):
 
 
 def main():
+    if sys.argv[1:] == ["--check"]:
+        print(f"face mesh ready: mediapipe {mp.__version__}, opencv {cv2.__version__}")
+        return 0
     parser = argparse.ArgumentParser()
     parser.add_argument("source")
     parser.add_argument("guide")
