@@ -54,7 +54,13 @@ def reader(path, width, height):
 
 
 def main():
-    if sys.argv[1:] == ["--check"]:
+    if sys.argv[1:2] == ["--check"]:
+        # Loading the landmarker also loads its native libraries (EGL), so a
+        # missing system package shows up here rather than on the first job.
+        if len(sys.argv) > 2:
+            options = mp.tasks.vision.FaceLandmarkerOptions(base_options=mp.tasks.BaseOptions(model_asset_path=sys.argv[2]))
+            with mp.tasks.vision.FaceLandmarker.create_from_options(options):
+                pass
         print(f"face mesh ready: mediapipe {mp.__version__}, opencv {cv2.__version__}")
         return 0
     parser = argparse.ArgumentParser()
