@@ -2685,6 +2685,83 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
             shutil.rmtree(mask_dir, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------
+# Face mesh: track faces on the original clip and draw a 478-point mesh on the
+# guide, for lip and expression timing. Runs face_mesh_worker.py in its own
+# environment (setup-face-mesh.sh) so MediaPipe and OpenCV stay out of the API's.
+# ---------------------------------------------------------------------------
+
+FACE_MESH_PYTHON = os.getenv("FACE_MESH_PYTHON") or os.path.join(BASE_DIR, ".venv-face", "bin", "python")
+FACE_MESH_MODEL = os.path.join(BASE_DIR, "models", "face_landmarker.task")
+FACE_MESH_WORKER = os.path.join(BASE_DIR, "face_mesh_worker.py")
+
+
+class FaceMeshRequest(BaseModel):
+    video_url: HttpUrl
+    guide_url: HttpUrl
+    max_faces: int = Field(default=4, ge=1, le=8)
+
+
+class FaceMeshResponse(MergeResponse):
+    frames: int
+    tracked_frames: int
+    faces: int
+
+
+def face_mesh_installed() -> bool:
+    return os.path.isfile(FACE_MESH_PYTHON) and os.path.isfile(FACE_MESH_MODEL)
+
+
+def draw_face_mesh(source_path: str, guide_path: str, output_path: str, max_faces: int) -> dict:
+    result = subprocess.run(
+        [FACE_MESH_PYTHON, FACE_MESH_WORKER, source_path, guide_path, output_path, FACE_MESH_MODEL, "--max-faces", str(max_faces)],
+        capture_output=True, text=True, timeout=240,
+    )
+    if result.returncode != 0:
+        raise_media_processing_error("Face mesh", result)
+    validate_rendered_output(output_path)
+    lines = [line for line in result.stdout.splitlines() if line.startswith("{")]
+    if not lines:
+        raise ValueError("Face mesh worker returned no summary")
+    return json.loads(lines[-1])
+
+
+@app.post("/face-mesh", response_model=FaceMeshResponse)
+async def face_mesh_endpoint(request: FaceMeshRequest, _: bool = Depends(verify_api_key)):
+    """Mesh the faces of `video_url` onto the same frames of `guide_url` (same frame count). Keeps the guide's audio."""
+    if not face_mesh_installed():
+        raise HTTPException(status_code=503, detail="Face mesh is not installed on this server (run setup-face-mesh.sh)")
+    async with processing_semaphore:
+        started = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        source_path = os.path.join(TEMP_DIR, f"mesh_source_{session_id}")
+        guide_path = os.path.join(TEMP_DIR, f"mesh_guide_{session_id}")
+        output_path = os.path.join(OUTPUT_DIR, f"meshed_{session_id}.mp4")
+        completed = False
+        try:
+            await asyncio.gather(download_file(str(request.video_url), source_path), download_file(str(request.guide_url), guide_path))
+            for path in (source_path, guide_path):
+                await asyncio.to_thread(assert_safe_media, path)
+            summary = await asyncio.to_thread(draw_face_mesh, source_path, guide_path, output_path, request.max_faces)
+            schedule_file_deletion(output_path)
+            completed = True
+            return FaceMeshResponse(
+                success=True, message="Face mesh drawn", output_path=output_path,
+                processing_time_seconds=round(time.perf_counter() - started, 3),
+                frames=int(summary["frames"]), tracked_frames=int(summary["tracked_frames"]), faces=int(summary["faces"]),
+            )
+        except MediaProcessingError as error:
+            raise HTTPException(status_code=422, detail=error.public_detail())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+        except httpx.HTTPError:
+            raise HTTPException(status_code=400, detail="Failed to download face mesh inputs")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=422, detail="Face mesh timed out")
+        finally:
+            cleanup_files([source_path, guide_path, None if completed else output_path])
+
+
 @app.get("/download/{filename}")
 async def download_output(filename: str):
     """Download the merged output file."""

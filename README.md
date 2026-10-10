@@ -11,7 +11,7 @@ A FastAPI server that merges multiple videos and adds an audio track with automa
 - Extract/cache exact source audio intervals (`/extract-audio`)
 - Trim videos (`/trim`)
 - Prepare silent grayscale depth guides with source timing (`/prepare-depth`)
-- Build masked depth guides for character swaps (`/normalize-video`, `/pitch-audio`, `/composite-masks`)
+- Build masked depth guides for character swaps (`/normalize-video`, `/pitch-audio`, `/composite-masks`, `/face-mesh`)
 - Reverse videos (`/reverse`)
 - Speed up or slow down videos (`/speed`)
 - Extract the 5th frame of a video as a PNG (`/extract-fifth-frame`)
@@ -299,3 +299,25 @@ output expires after 120 seconds, so download each one via
    resampled to the clip's size and rate. `audio_url` is optional; without it
    the output is silent. Returns `frames` and `masked_frames`; a zip set with no
    masks at all returns 422.
+
+## Face mesh
+
+`POST /face-mesh` `{"video_url": "<normalized clip>", "guide_url": "<composite guide>", "max_faces": 4}`
+tracks faces on the clip with Google's MediaPipe Face Landmarker (478 points)
+and draws the mesh (lips and eyes highlighted) on the same frames of the guide,
+keeping the guide's audio. Both videos must have the same frame count; the mesh
+is placed by normalized coordinates, so their sizes may differ. Returns
+`frames`, `tracked_frames` and `faces` (the most faces in one frame).
+
+The worker runs in its own environment so MediaPipe and OpenCV stay out of the
+API's dependencies. Install it once per server:
+
+```bash
+sudo apt install -y libgl1 libglib2.0-0 libportaudio2
+bash setup-face-mesh.sh
+```
+
+This creates `.venv-face`, installs `mediapipe==1.1.0` and downloads the model
+to `models/face_landmarker.task`. Without them `/face-mesh` returns 503.
+`FACE_MESH_PYTHON` overrides the worker's interpreter. To run the worker in the
+tests, set `FACE_MESH_TEST_PYTHON` and `FACE_MESH_TEST_MODEL`.

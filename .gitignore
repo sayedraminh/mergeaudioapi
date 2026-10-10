@@ -26,3 +26,7 @@ node_modules/
 *.egg-info/
 dist/
 build/
+
+# Face mesh worker
+.venv-face/
+models/
