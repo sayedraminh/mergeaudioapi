@@ -2276,6 +2276,382 @@ async def extract_fifth_frame_endpoint(
             raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---------------------------------------------------------------------------
+# Masked depth guide (character swap): the caller normalizes the source once,
+# sends that exact clip to depth and SAM 3, then composites the depth people
+# over the original background and embeds pitch-shifted vocals.
+# ---------------------------------------------------------------------------
+
+GUIDE_MAX_SECONDS = 30
+GUIDE_MAX_FRAMES = GUIDE_MAX_SECONDS * 60
+
+
+class NormalizeVideoRequest(BaseModel):
+    video_url: HttpUrl
+    start_seconds: float = Field(default=0, ge=0, allow_inf_nan=False)
+    end_seconds: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
+    fps: int = Field(default=24, ge=12, le=60)
+    max_dimension: int = Field(default=1280, ge=64, le=2160)
+
+
+class NormalizeVideoResponse(MergeResponse):
+    width: int
+    height: int
+    fps: int
+    frames: int
+    duration_seconds: float
+    has_audio: bool
+
+
+class PitchAudioRequest(BaseModel):
+    audio_url: HttpUrl
+    semitones: float = Field(default=3, ge=-12, le=12, allow_inf_nan=False)
+
+
+class PitchAudioResponse(MergeResponse):
+    semitones: float
+    duration_seconds: float
+    engine: str
+
+
+class MaskZip(BaseModel):
+    url: HttpUrl
+    # Frame of the normalized video that this zip's mask_00000.png belongs to.
+    start_frame: int = Field(default=0, ge=0, le=GUIDE_MAX_FRAMES)
+
+
+class CompositeMasksRequest(BaseModel):
+    video_url: HttpUrl
+    depth_url: HttpUrl
+    mask_zips: List[MaskZip] = Field(min_length=1, max_length=8)
+    audio_url: Optional[HttpUrl] = None
+    # Grow each mask by roughly this many pixels so the silhouette carries less
+    # of the original body shape. 0 keeps SAM's exact outline.
+    spread_pixels: int = Field(default=0, ge=0, le=64)
+
+
+class CompositeMasksResponse(MergeResponse):
+    width: int
+    height: int
+    fps: int
+    frames: int
+    masked_frames: int
+    duration_seconds: float
+    has_audio: bool
+
+
+def probe_video_stream(file_path: str) -> dict:
+    """Exact decoded frame count, size and frame rate of the first video stream."""
+    result = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
+        "-show_entries", "stream=width,height,r_frame_rate,nb_read_frames",
+        "-of", "json", file_path,
+    ], capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise_media_processing_error("Video probe", result)
+    streams = json.loads(result.stdout or "{}").get("streams") or []
+    if not streams:
+        raise ValueError("Media has no video stream")
+    stream = streams[0]
+    numerator, _, denominator = str(stream.get("r_frame_rate", "0/1")).partition("/")
+    fps = float(numerator) / float(denominator or 1) if float(denominator or 1) else 0
+    return {"width": int(stream["width"]), "height": int(stream["height"]), "fps": fps, "frames": int(stream.get("nb_read_frames") or 0)}
+
+
+def even_size_within(width: int, height: int, max_dimension: int) -> Tuple[int, int]:
+    scale = min(1.0, max_dimension / max(width, height))
+    return max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)
+
+
+def normalize_guide_video(input_path: str, output_path: str, start: float, end: Optional[float], fps: int, max_dimension: int) -> dict:
+    """Constant frame rate, even size within max_dimension, exactly round(duration * fps) frames.
+
+    The video track decides the length; a longer audio track is cut and a shorter one padded with
+    silence, so depth, SAM masks and audio all share one clock.
+    """
+    source = probe_video_stream(input_path)
+    # The video track's own length: the container reports the longer of video and audio.
+    probed = subprocess.run([
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration", "-of", "csv=p=0", input_path,
+    ], capture_output=True, text=True, timeout=60).stdout.strip()
+    try:
+        video_end = float(probed)
+    except ValueError:
+        video_end = get_media_duration(input_path)
+    if not math.isfinite(video_end) or video_end <= 0:
+        video_end = get_media_duration(input_path)
+    end = min(end if end is not None else video_end, video_end)
+    if end - start <= 0 or end - start > GUIDE_MAX_SECONDS + 0.05:
+        raise ValueError(f"Video range must be positive and at most {GUIDE_MAX_SECONDS} seconds")
+    frames = max(1, round((end - start) * fps))
+    duration = frames / fps
+    width, height = even_size_within(source["width"], source["height"], max_dimension)
+    has_audio = has_audio_stream(input_path)
+    cmd = ["ffmpeg", "-y", "-ss", f"{start:.6f}", "-i", input_path, "-map", "0:v:0"]
+    if has_audio:
+        cmd += ["-map", "0:a:0", "-af", f"aresample=48000:first_pts=0,apad,atrim=duration={duration:.6f}", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+    else:
+        cmd += ["-an"]
+    cmd += [
+        "-vf", f"fps={fps},scale={width}:{height}:flags=lanczos,setsar=1,tpad=stop_mode=clone:stop_duration=1",
+        "-frames:v", str(frames), "-c:v", "libx264", "-preset", "fast", "-crf", "16",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    if result.returncode != 0:
+        raise_media_processing_error("Video normalization", result)
+    validate_rendered_output(output_path)
+    rendered = probe_video_stream(output_path)
+    if rendered["frames"] != frames:
+        raise ValueError(f"Normalized video has {rendered['frames']} frames, expected {frames}")
+    return {"width": width, "height": height, "fps": fps, "frames": frames, "duration": duration, "has_audio": has_audio}
+
+
+def ffmpeg_has_filter(name: str) -> bool:
+    result = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True, timeout=30)
+    return any(line.split()[1:2] == [name] for line in result.stdout.splitlines() if line.strip())
+
+
+def pitch_shift_audio(input_path: str, output_path: str, semitones: float) -> Tuple[float, str]:
+    """Shift pitch by `semitones` without changing length (Rubber Band)."""
+    duration = get_media_duration(input_path)
+    if ffmpeg_has_filter("rubberband"):
+        engine = "ffmpeg-rubberband"
+        result = subprocess.run([
+            "ffmpeg", "-y", "-i", input_path, "-vn",
+            "-af", f"rubberband=pitch={2 ** (semitones / 12):.9f}:pitchq=quality:transients=crisp,apad,atrim=duration={duration:.6f}",
+            "-c:a", "pcm_s16le", output_path,
+        ], capture_output=True, text=True, timeout=180)
+    else:
+        # Same library through its CLI (Ubuntu: apt install rubberband-cli).
+        engine = "rubberband-cli"
+        wav_input = output_path + ".source.wav"
+        try:
+            converted = subprocess.run(["ffmpeg", "-y", "-i", input_path, "-vn", "-c:a", "pcm_s16le", wav_input], capture_output=True, text=True, timeout=120)
+            if converted.returncode != 0:
+                raise_media_processing_error("Audio decode", converted)
+            try:
+                result = subprocess.run(["rubberband", "--fine", "--pitch", str(semitones), "--time", "1", wav_input, output_path], capture_output=True, text=True, timeout=180)
+            except FileNotFoundError:
+                raise RuntimeError("Rubber Band is not installed: use an FFmpeg build with librubberband or install rubberband-cli")
+        finally:
+            cleanup_files([wav_input])
+    if result.returncode != 0:
+        raise_media_processing_error("Pitch shift", result)
+    validate_rendered_output(output_path)
+    shifted = get_media_duration(output_path)
+    if abs(shifted - duration) > 0.05:
+        raise ValueError("Pitch-shifted audio length does not match the source")
+    return shifted, engine
+
+
+def unpack_mask_zips(zip_paths: List[Tuple[str, int]], mask_dir: str, frames: int) -> Tuple[int, Tuple[int, int]]:
+    """Write one mask_NNNNN.png per video frame; frames SAM left out (nobody found) stay blank."""
+    import re
+    import zipfile
+    import shutil
+    pattern = re.compile(r"(?:^|/)mask_(\d+)\.png$")
+    found = 0
+    first_mask = None
+    for zip_path, start_frame in zip_paths:
+        with zipfile.ZipFile(zip_path) as archive:
+            for name in archive.namelist():
+                match = pattern.search(name)
+                if not match:
+                    continue
+                index = start_frame + int(match.group(1))
+                if index >= frames:
+                    continue
+                target = os.path.join(mask_dir, f"mask_{index:05d}.png")
+                with archive.open(name) as source, open(target, "wb") as destination:
+                    shutil.copyfileobj(source, destination)
+                found += 1
+                first_mask = first_mask or target
+    if not first_mask:
+        raise ValueError("SAM found no people in this video")
+    width, height = get_video_dimensions(first_mask)
+    pix_fmt = subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", first_mask,
+    ], capture_output=True, text=True, timeout=30).stdout.strip() or "gray"
+    blank = os.path.join(mask_dir, "blank.png")
+    # Same pixel format as SAM's masks: a format change mid-sequence makes FFmpeg drop frames.
+    result = subprocess.run([
+        "ffmpeg", "-y", "-f", "lavfi", "-i", f"color=black:s={width}x{height}", "-frames:v", "1", "-pix_fmt", pix_fmt, blank,
+    ], capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise_media_processing_error("Blank mask", result)
+    for index in range(frames):
+        target = os.path.join(mask_dir, f"mask_{index:05d}.png")
+        if not os.path.exists(target):
+            shutil.copyfile(blank, target)
+    return found, (width, height)
+
+
+def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int) -> dict:
+    """Depth pixels inside the SAM mask, the original frame everywhere else."""
+    source = probe_video_stream(video_path)
+    frames, width, height = source["frames"], source["width"], source["height"]
+    fps = round(source["fps"])
+    if not frames or not fps:
+        raise ValueError("Could not read the normalized video")
+    mask_chain = f"scale={width}:{height}:flags=neighbor,format=gray"
+    if spread_pixels:
+        # Blur then threshold low: grows the mask by about spread_pixels and rounds its outline.
+        mask_chain += f",gblur=sigma={max(1, spread_pixels / 2)}"
+        mask_chain += ",lut=y='if(gt(val,8),255,0)'"
+    else:
+        mask_chain += ",lut=y='if(gt(val,127),255,0)'"
+    filter_complex = (
+        "[0:v]format=gbrp[original];"
+        f"[1:v]fps={fps},scale={width}:{height}:flags=bilinear,tpad=stop_mode=clone:stop_duration=1,format=gbrp[depth];"
+        f"[2:v]{mask_chain},format=gbrp[mask];"
+        "[original][depth][mask]maskedmerge,format=yuv420p[video]"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path, "-i", depth_path,
+        "-framerate", str(fps), "-i", os.path.join(mask_dir, "mask_%05d.png"),
+    ]
+    if audio_path:
+        cmd += ["-i", audio_path]
+    cmd += ["-filter_complex", filter_complex, "-map", "[video]"]
+    duration = frames / fps
+    if audio_path:
+        cmd += ["-map", "3:a:0", "-af", f"apad,atrim=duration={duration:.6f}", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+    else:
+        cmd += ["-an"]
+    cmd += [
+        "-frames:v", str(frames), "-c:v", "libx264", "-preset", "fast", "-crf", "17",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", output_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise_media_processing_error("Mask composite", result)
+    validate_rendered_output(output_path)
+    rendered = probe_video_stream(output_path)
+    if rendered["frames"] != frames:
+        raise ValueError(f"Composite has {rendered['frames']} frames, expected {frames}")
+    return {"width": width, "height": height, "fps": fps, "frames": frames, "duration": duration}
+
+
+@app.post("/normalize-video", response_model=NormalizeVideoResponse)
+async def normalize_video_endpoint(request: NormalizeVideoRequest, _: bool = Depends(verify_api_key)):
+    """One constant-rate clip that depth, SAM and audio separation all read, so their frames line up."""
+    if request.end_seconds is not None and request.end_seconds <= request.start_seconds:
+        raise HTTPException(status_code=422, detail="end_seconds must be after start_seconds")
+    async with processing_semaphore:
+        started = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        input_path = os.path.join(TEMP_DIR, f"normalize_input_{session_id}")
+        output_path = os.path.join(OUTPUT_DIR, f"normalized_{session_id}.mp4")
+        completed = False
+        try:
+            await download_file(str(request.video_url), input_path)
+            meta = await asyncio.to_thread(
+                normalize_guide_video, input_path, output_path, request.start_seconds,
+                request.end_seconds, request.fps, request.max_dimension,
+            )
+            schedule_file_deletion(output_path)
+            completed = True
+            return NormalizeVideoResponse(
+                success=True, message="Video normalized", output_path=output_path,
+                processing_time_seconds=round(time.perf_counter() - started, 3),
+                width=meta["width"], height=meta["height"], fps=meta["fps"], frames=meta["frames"],
+                duration_seconds=round(meta["duration"], 6), has_audio=meta["has_audio"],
+            )
+        except MediaProcessingError as error:
+            raise HTTPException(status_code=422, detail=error.public_detail())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+        except httpx.HTTPError:
+            raise HTTPException(status_code=400, detail="Failed to download video")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=422, detail="Video normalization timed out")
+        finally:
+            cleanup_files([input_path, None if completed else output_path])
+
+
+@app.post("/pitch-audio", response_model=PitchAudioResponse)
+async def pitch_audio_endpoint(request: PitchAudioRequest, _: bool = Depends(verify_api_key)):
+    """Pitch-shift isolated vocals (Rubber Band) without changing their timing. Returns WAV."""
+    async with processing_semaphore:
+        started = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        input_path = os.path.join(TEMP_DIR, f"pitch_input_{session_id}")
+        output_path = os.path.join(OUTPUT_DIR, f"pitched_{session_id}.wav")
+        completed = False
+        try:
+            await download_file(str(request.audio_url), input_path)
+            duration, engine = await asyncio.to_thread(pitch_shift_audio, input_path, output_path, request.semitones)
+            schedule_file_deletion(output_path)
+            completed = True
+            return PitchAudioResponse(
+                success=True, message="Audio pitch-shifted", output_path=output_path,
+                processing_time_seconds=round(time.perf_counter() - started, 3),
+                semitones=request.semitones, duration_seconds=round(duration, 6), engine=engine,
+            )
+        except MediaProcessingError as error:
+            raise HTTPException(status_code=422, detail=error.public_detail())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+        except RuntimeError as error:
+            raise HTTPException(status_code=500, detail=str(error))
+        except httpx.HTTPError:
+            raise HTTPException(status_code=400, detail="Failed to download audio")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=422, detail="Pitch shift timed out")
+        finally:
+            cleanup_files([input_path, None if completed else output_path])
+
+
+@app.post("/composite-masks", response_model=CompositeMasksResponse)
+async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Depends(verify_api_key)):
+    """Lay the depth video's people (SAM 3 masks) over the normalized original; optionally embed audio."""
+    import shutil
+    async with processing_semaphore:
+        started = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        video_path = os.path.join(TEMP_DIR, f"composite_video_{session_id}")
+        depth_path = os.path.join(TEMP_DIR, f"composite_depth_{session_id}")
+        audio_path = os.path.join(TEMP_DIR, f"composite_audio_{session_id}") if request.audio_url else None
+        zip_paths = [os.path.join(TEMP_DIR, f"composite_masks_{session_id}_{index}.zip") for index in range(len(request.mask_zips))]
+        mask_dir = os.path.join(TEMP_DIR, f"composite_masks_{session_id}")
+        output_path = os.path.join(OUTPUT_DIR, f"composite_{session_id}.mp4")
+        completed = False
+        try:
+            downloads = [download_file(str(request.video_url), video_path), download_file(str(request.depth_url), depth_path)]
+            downloads += [download_file(str(item.url), path) for item, path in zip(request.mask_zips, zip_paths)]
+            if audio_path:
+                downloads.append(download_file(str(request.audio_url), audio_path))
+            await asyncio.gather(*downloads)
+            frames = (await asyncio.to_thread(probe_video_stream, video_path))["frames"]
+            if not frames or frames > GUIDE_MAX_FRAMES:
+                raise ValueError("Normalized video frame count is out of range")
+            os.makedirs(mask_dir, exist_ok=True)
+            masked_frames, _ = await asyncio.to_thread(
+                unpack_mask_zips, [(path, item.start_frame) for item, path in zip(request.mask_zips, zip_paths)], mask_dir, frames,
+            )
+            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels)
+            schedule_file_deletion(output_path)
+            completed = True
+            return CompositeMasksResponse(
+                success=True, message="Depth people composited over the original", output_path=output_path,
+                processing_time_seconds=round(time.perf_counter() - started, 3),
+                width=meta["width"], height=meta["height"], fps=meta["fps"], frames=meta["frames"],
+                masked_frames=masked_frames, duration_seconds=round(meta["duration"], 6), has_audio=bool(audio_path),
+            )
+        except MediaProcessingError as error:
+            raise HTTPException(status_code=422, detail=error.public_detail())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+        except httpx.HTTPError:
+            raise HTTPException(status_code=400, detail="Failed to download composite inputs")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=422, detail="Mask composite timed out")
+        finally:
+            cleanup_files([video_path, depth_path, audio_path, *zip_paths, None if completed else output_path])
+            shutil.rmtree(mask_dir, ignore_errors=True)
+
+
 @app.get("/download/{filename}")
 async def download_output(filename: str):
     """Download the merged output file."""

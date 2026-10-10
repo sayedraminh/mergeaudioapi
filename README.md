@@ -11,6 +11,7 @@ A FastAPI server that merges multiple videos and adds an audio track with automa
 - Extract/cache exact source audio intervals (`/extract-audio`)
 - Trim videos (`/trim`)
 - Prepare silent grayscale depth guides with source timing (`/prepare-depth`)
+- Build masked depth guides for character swaps (`/normalize-video`, `/pitch-audio`, `/composite-masks`)
 - Reverse videos (`/reverse`)
 - Speed up or slow down videos (`/speed`)
 - Extract the 5th frame of a video as a PNG (`/extract-fifth-frame`)
@@ -26,6 +27,8 @@ The production target is:
 - Ubuntu Server 26.04 LTS
 - Python 3.14
 - FFmpeg 8.x, with both `ffmpeg` and `ffprobe` on `PATH`
+- Rubber Band for `/pitch-audio`: either FFmpeg's `rubberband` filter (Ubuntu's
+  `ffmpeg` package includes it) or the `rubberband` CLI from `rubberband-cli`
 - Writable `temp/` and `output/` directories with enough space for source and rendered media
 
 `requirements.txt` contains the pinned production dependency set. Test tools are
@@ -35,7 +38,7 @@ kept in `requirements-dev.txt`.
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv python3-pip ffmpeg
+sudo apt install -y python3 python3-venv python3-pip ffmpeg rubberband-cli
 
 git clone https://github.com/sayedraminh/mergeaudioapi.git
 cd mergeaudioapi
@@ -265,3 +268,31 @@ and persist it; outputs expire after 120 seconds. Sources may be videos or
 previously extracted audio. Intervals are at most 30 seconds, use source
 seconds without speed changes, and pad short audio tracks to the requested
 video interval. A silent source returns `had_audio: false` with no output.
+
+## Masked depth guide
+
+Three steps prepare a character-swap guide video: the swap model sees depth
+silhouettes where the people were, the real background everywhere else, and
+pitch-shifted vocals instead of the original soundtrack. The caller runs the
+AI models (depth, SAM 3 masks, vocal separation) between these calls. Every
+output expires after 120 seconds, so download each one via
+`/download/{filename}` and persist it.
+
+1. `POST /normalize-video` `{"video_url": "...", "start_seconds": 0, "end_seconds": 22.4, "fps": 24, "max_dimension": 1280}`
+   returns an H.264 + AAC clip at a constant frame rate with exactly
+   `round(duration * fps)` frames (`frames`, `width`, `height`, `has_audio`).
+   The video track sets the length: longer audio is cut, shorter audio padded.
+   Send this exact clip to depth, SAM and vocal separation so their frames line up.
+2. `POST /pitch-audio` `{"audio_url": "...", "semitones": 3}` returns a WAV of the
+   same length, pitch-shifted with Rubber Band (`engine` says whether FFmpeg's
+   filter or the CLI ran).
+3. `POST /composite-masks` with
+   `{"video_url": "<normalized clip>", "depth_url": "...", "mask_zips": [{"url": "...", "start_frame": 0}], "audio_url": "<pitched vocals>", "spread_pixels": 0}`
+   puts depth pixels inside the SAM masks over the normalized clip. Zips hold
+   `mask_NNNNN.png` files (SAM 3 `mask_only` + `return_zip`); `start_frame`
+   offsets a zip made from a later section. Frames with no mask file keep the
+   original. `spread_pixels` grows each mask by about that many pixels, which
+   fills small holes and blurs the original body outline. The depth video is
+   resampled to the clip's size and rate. `audio_url` is optional; without it
+   the output is silent. Returns `frames` and `masked_frames`; a zip set with no
+   masks at all returns 422.
