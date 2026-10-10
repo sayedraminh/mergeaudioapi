@@ -164,3 +164,30 @@ def test_guide_endpoints_refuse_playlists(guide):
         assert response.status_code == 422, response.text
         assert "Unsupported media format" in response.text
     assert list(temp.iterdir()) == []
+
+
+def test_composite_masks_fills_gaps_closed_by_the_person_and_bottom_edge(guide):
+    client, files, tmp, _ = guide
+    video, depth = tmp / "video.mp4", tmp / "depth.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=blue:s=64x32:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video))
+    ffmpeg("-f", "lavfi", "-i", "color=c=red:s=64x32:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(depth))
+    mask = tmp / "mask.png"
+    # A torso (x 8-40) with a tie-shaped gap (x 20-28) running to the bottom edge.
+    ffmpeg("-f", "lavfi", "-i", "color=c=black:s=64x32", "-vf",
+           "drawbox=x=8:y=4:w=32:h=28:color=white:t=fill,drawbox=x=20:y=12:w=8:h=20:color=black:t=fill",
+           "-frames:v", "1", str(mask))
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as handle:
+        for index in range(12):
+            handle.write(mask, f"mask_{index:05d}.png")
+    (tmp / "m.zip").write_bytes(archive.getvalue())
+    files.update({"https://example.com/v.mp4": video, "https://example.com/d.mp4": depth, "https://example.com/m.zip": tmp / "m.zip"})
+    body = {"video_url": "https://example.com/v.mp4", "depth_url": "https://example.com/d.mp4", "mask_zips": [{"url": "https://example.com/m.zip"}]}
+    filled = client.post("/composite-masks", headers=HEADERS, json=body)
+    assert filled.status_code == 200, filled.text
+    pixel = frame_pixels(filled.json()["output_path"], 3, 64, 32)
+    assert pixel(24, 24)[0] > 200  # the gap now shows depth
+    assert pixel(54, 16)[2] > 200  # open background stays original
+    assert pixel(54, 31)[2] > 200  # including the bottom row
+    kept = client.post("/composite-masks", headers=HEADERS, json={**body, "fill_holes": False})
+    assert frame_pixels(kept.json()["output_path"], 3, 64, 32)(24, 24)[2] > 200

@@ -292,7 +292,10 @@ output expires after 120 seconds, so download each one via
    `mask_NNNNN.png` files (SAM 3 `mask_only` + `return_zip`); `start_frame`
    offsets a zip made from a later section. Frames with no mask file keep the
    original. `spread_pixels` grows each mask by about that many pixels, which
-   fills small holes and blurs the original body outline. The depth video is
+   fills small holes and blurs the original body outline. `fill_holes` (default
+   `true`) also fills any region the mask closes off, counting the bottom edge
+   as closed, so clothing SAM left out (a tie running off the bottom of a
+   close-up) shows depth instead of the original costume. The depth video is
    resampled to the clip's size and rate. `audio_url` is optional; without it
    the output is silent. Returns `frames` and `masked_frames`; a zip set with no
    masks at all returns 422.

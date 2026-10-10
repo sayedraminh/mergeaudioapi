@@ -2328,6 +2328,10 @@ class CompositeMasksRequest(BaseModel):
     # Grow each mask by roughly this many pixels so the silhouette carries less
     # of the original body shape. 0 keeps SAM's exact outline.
     spread_pixels: int = Field(default=0, ge=0, le=64)
+    # Fill regions the mask closes off, counting the bottom edge as closed: SAM
+    # leaves some clothing (a tie, a bag strap) out of the person, and the
+    # original costume would show through.
+    fill_holes: bool = True
 
 
 class CompositeMasksResponse(MergeResponse):
@@ -2501,20 +2505,30 @@ def unpack_mask_zips(zip_paths: List[Tuple[str, int]], mask_dir: str, frames: in
     return found, (width, height)
 
 
-def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int) -> dict:
+# Background is flooded from a black border on the top, left and right; the
+# bottom border is white, so a gap that only reaches the bottom edge counts as
+# enclosed. Full range RGB keeps black at 0 for floodfill.
+FILL_HOLES_CHAIN = (
+    "pad=w=iw+2:h=ih+2:x=1:y=1:color=black,drawbox=x=0:y=ih-1:w=iw:h=1:color=white:t=fill,"
+    "format=gbrp,floodfill=x=0:y=0:s0=0:s1=0:s2=0:d0=128:d1=128:d2=128,format=gray,"
+    "lut=y='if(between(val,100,156),0,255)',crop=iw-2:ih-2:1:1"
+)
+
+
+def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True) -> dict:
     """Depth pixels inside the SAM mask, the original frame everywhere else."""
     source = probe_video_stream(video_path)
     frames, width, height = source["frames"], source["width"], source["height"]
     fps = round(source["fps"])
     if not frames or not fps:
         raise ValueError("Could not read the normalized video")
-    mask_chain = f"scale={width}:{height}:flags=neighbor,format=gray"
+    mask_chain = f"scale={width}:{height}:flags=neighbor,format=gray,lut=y='if(gt(val,127),255,0)'"
+    if fill_holes:
+        mask_chain += f",{FILL_HOLES_CHAIN}"
     if spread_pixels:
         # Blur then threshold low: grows the mask by about spread_pixels and rounds its outline.
         mask_chain += f",gblur=sigma={max(1, spread_pixels / 2)}"
         mask_chain += ",lut=y='if(gt(val,8),255,0)'"
-    else:
-        mask_chain += ",lut=y='if(gt(val,127),255,0)'"
     filter_complex = (
         "[0:v]format=gbrp[original];"
         f"[1:v]fps={fps},scale={width}:{height}:flags=bilinear,tpad=stop_mode=clone:stop_duration=1,format=gbrp[depth];"
@@ -2649,7 +2663,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
             masked_frames, _ = await asyncio.to_thread(
                 unpack_mask_zips, [(path, item.start_frame) for item, path in zip(request.mask_zips, zip_paths)], mask_dir, frames,
             )
-            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels)
+            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels, request.fill_holes)
             schedule_file_deletion(output_path)
             completed = True
             return CompositeMasksResponse(
