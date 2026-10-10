@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -68,3 +69,43 @@ def test_face_mesh_keeps_the_guide_frames_and_audio(mesh, monkeypatch):
     files["https://example.com/short.mp4"] = short
     response = client.post("/face-mesh", headers=HEADERS, json={"video_url": "https://example.com/source.mp4", "guide_url": "https://example.com/short.mp4"})
     assert response.status_code == 422
+
+
+def test_face_mesh_kills_the_worker_and_its_children_on_timeout(mesh, monkeypatch, tmp_path):
+    client, files, tmp, temp = mesh
+    # A stand-in worker that starts a child and never finishes.
+    worker = tmp_path / "slow_worker.py"
+    pid_file = tmp_path / "child.pid"
+    worker.write_text(
+        "import subprocess, time\n"
+        "child = subprocess.Popen(['sleep', '60'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+    model = tmp_path / "model.task"
+    model.write_text("x")
+    monkeypatch.setattr(main, "FACE_MESH_PYTHON", os.sys.executable)
+    monkeypatch.setattr(main, "FACE_MESH_WORKER", str(worker))
+    monkeypatch.setattr(main, "FACE_MESH_MODEL", str(model))
+    real_popen = subprocess.Popen
+
+    class QuickTimeout(real_popen):
+        def communicate(self, input=None, timeout=None):
+            return super().communicate(input, timeout=2 if timeout else None)
+
+    monkeypatch.setattr(main.subprocess, "Popen", QuickTimeout)
+    clip = tmp / "clip.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=red:s=64x48:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip))
+    files.update({"https://example.com/a.mp4": clip, "https://example.com/b.mp4": clip})
+    response = client.post("/face-mesh", headers=HEADERS, json={"video_url": "https://example.com/a.mp4", "guide_url": "https://example.com/b.mp4"})
+    assert response.status_code == 422 and "timed out" in response.text
+    child = int(pid_file.read_text())
+    # The orphaned child is reparented and reaped; give that a moment.
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("the worker's child process survived the timeout")

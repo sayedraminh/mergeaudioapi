@@ -1,4 +1,5 @@
 import os
+import signal
 import sys
 import uuid
 import json
@@ -2713,10 +2714,24 @@ def face_mesh_installed() -> bool:
 
 
 def draw_face_mesh(source_path: str, guide_path: str, output_path: str, max_faces: int) -> dict:
-    result = subprocess.run(
+    # Same length cap as the other guide endpoints.
+    for path in (source_path, guide_path):
+        frames = probe_video_stream(path)["frames"]
+        if not frames or frames > GUIDE_MAX_FRAMES:
+            raise ValueError("Face mesh input frame count is out of range")
+    # The worker starts its own ffmpeg processes; run it in a new session so a
+    # timeout kills all of them, not just the worker.
+    process = subprocess.Popen(
         [FACE_MESH_PYTHON, FACE_MESH_WORKER, source_path, guide_path, output_path, FACE_MESH_MODEL, "--max-faces", str(max_faces)],
-        capture_output=True, text=True, timeout=240,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
     )
+    try:
+        stdout, stderr = process.communicate(timeout=240)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+    result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
     if result.returncode != 0:
         raise_media_processing_error("Face mesh", result)
     validate_rendered_output(output_path)
