@@ -2465,33 +2465,53 @@ def pitch_shift_audio(input_path: str, output_path: str, semitones: float) -> Tu
 
 
 def unpack_mask_zips(zip_paths: List[Tuple[str, int]], mask_dir: str, frames: int) -> Tuple[int, Tuple[int, int]]:
-    """Write one mask_NNNNN.png per video frame; frames SAM left out (nobody found) stay blank."""
+    """Write one mask_NNNNN.png per video frame; frames SAM left out (nobody found) stay blank.
+
+    Zips that cover the same frames (SAM run with two prompts, e.g. "person" and
+    "character") go into separate layers that are unioned with one FFmpeg pass
+    per extra layer, so a request never starts more than len(zip_paths) - 1 of them.
+    Every mask is decoded as PNG explicitly: a zip entry is untrusted bytes, and
+    letting FFmpeg sniff its format could turn it into a playlist that reads
+    other files or URLs.
+    """
     import re
     import zipfile
     import shutil
     pattern = re.compile(r"(?:^|/)mask_(\d+)\.png$")
-    found = 0
-    first_mask = None
+    layers: List[Tuple[str, set]] = []
     for zip_path, start_frame in zip_paths:
         with zipfile.ZipFile(zip_path) as archive:
+            entries = []
             for name in archive.namelist():
                 match = pattern.search(name)
-                if not match:
-                    continue
-                index = start_frame + int(match.group(1))
-                if index >= frames:
-                    continue
-                target = os.path.join(mask_dir, f"mask_{index:05d}.png")
-                with archive.open(name) as source, open(target, "wb") as destination:
+                if match and start_frame + int(match.group(1)) < frames:
+                    entries.append((start_frame + int(match.group(1)), name))
+            indexes = {index for index, _ in entries}
+            layer = next((candidate for candidate in layers if not candidate[1] & indexes), None)
+            if layer is None:
+                layer = (mask_dir if not layers else os.path.join(mask_dir, f"layer_{len(layers)}"), set())
+                os.makedirs(layer[0], exist_ok=True)
+                layers.append(layer)
+            for index, name in entries:
+                with archive.open(name) as source, open(os.path.join(layer[0], f"mask_{index:05d}.png"), "wb") as destination:
                     shutil.copyfileobj(source, destination)
-                found += 1
-                first_mask = first_mask or target
-    if not first_mask:
+            layer[1].update(indexes)
+    masked = set().union(*(indexes for _, indexes in layers)) if layers else set()
+    if not masked:
         raise ValueError("SAM found no people in this video")
-    width, height = get_video_dimensions(first_mask)
-    pix_fmt = subprocess.run([
-        "ffprobe", "-v", "error", "-show_entries", "stream=pix_fmt", "-of", "csv=p=0", first_mask,
-    ], capture_output=True, text=True, timeout=30).stdout.strip() or "gray"
+    first_index = min(masked)
+    first_mask = next(os.path.join(directory, f"mask_{first_index:05d}.png") for directory, indexes in layers if first_index in indexes)
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-f", "png_pipe", "-show_entries", "stream=width,height,pix_fmt", "-of", "csv=p=0", first_mask,
+    ], capture_output=True, text=True, timeout=30)
+    try:
+        width_text, height_text, *rest = probe.stdout.strip().split(",")
+        width, height = int(width_text), int(height_text)
+    except ValueError:
+        raise ValueError("SAM returned a mask that is not a PNG image")
+    pix_fmt = (rest[0] if rest else "") or "gray"
+    if probe.returncode != 0 or width <= 0 or height <= 0 or pix_fmt == "unknown":
+        raise ValueError("SAM returned a mask that is not a PNG image")
     blank = os.path.join(mask_dir, "blank.png")
     # Same pixel format as SAM's masks: a format change mid-sequence makes FFmpeg drop frames.
     result = subprocess.run([
@@ -2499,11 +2519,28 @@ def unpack_mask_zips(zip_paths: List[Tuple[str, int]], mask_dir: str, frames: in
     ], capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
         raise_media_processing_error("Blank mask", result)
-    for index in range(frames):
-        target = os.path.join(mask_dir, f"mask_{index:05d}.png")
-        if not os.path.exists(target):
-            shutil.copyfile(blank, target)
-    return found, (width, height)
+    for directory, _ in layers:
+        for index in range(frames):
+            target = os.path.join(directory, f"mask_{index:05d}.png")
+            if not os.path.exists(target):
+                shutil.copyfile(blank, target)
+    for directory, _ in layers[1:]:
+        union_dir = os.path.join(mask_dir, "union")
+        os.makedirs(union_dir, exist_ok=True)
+        result = subprocess.run([
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "image2", "-c:v", "png", "-start_number", "0", "-i", os.path.join(mask_dir, "mask_%05d.png"),
+            "-f", "image2", "-c:v", "png", "-start_number", "0", "-i", os.path.join(directory, "mask_%05d.png"),
+            "-filter_complex", f"[0:v]format=gray,scale={width}:{height}[a];[1:v]format=gray,scale={width}:{height}[b];[a][b]blend=all_mode=lighten,format={pix_fmt}",
+            "-frames:v", str(frames), "-start_number", "0", "-f", "image2", os.path.join(union_dir, "mask_%05d.png"),
+        ], capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise_media_processing_error("Mask union", result)
+        for index in range(frames):
+            os.replace(os.path.join(union_dir, f"mask_{index:05d}.png"), os.path.join(mask_dir, f"mask_{index:05d}.png"))
+        shutil.rmtree(union_dir, ignore_errors=True)
+        shutil.rmtree(directory, ignore_errors=True)
+    return len(masked), (width, height)
 
 
 # Background is flooded from a black border on the top, left and right; the
