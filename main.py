@@ -2482,6 +2482,23 @@ def unpack_mask_zips(zip_paths: List[Tuple[str, int]], mask_dir: str, frames: in
                 if index >= frames:
                     continue
                 target = os.path.join(mask_dir, f"mask_{index:05d}.png")
+                if os.path.exists(target):
+                    # Two SAM runs (e.g. "person" and "character") cover the same
+                    # frame: keep every pixel either one marked.
+                    extra = os.path.join(mask_dir, f"extra_{index:05d}.png")
+                    union = os.path.join(mask_dir, f"union_{index:05d}.png")
+                    with archive.open(name) as source, open(extra, "wb") as destination:
+                        shutil.copyfileobj(source, destination)
+                    result = subprocess.run([
+                        "ffmpeg", "-v", "error", "-y", "-i", target, "-i", extra,
+                        "-filter_complex", "[0:v]format=gray[a];[1:v]format=gray[b];[a][b]blend=all_mode=lighten",
+                        "-frames:v", "1", "-pix_fmt", "gray", union,
+                    ], capture_output=True, text=True, timeout=30)
+                    if result.returncode != 0:
+                        raise_media_processing_error("Mask union", result)
+                    os.replace(union, target)
+                    os.remove(extra)
+                    continue
                 with archive.open(name) as source, open(target, "wb") as destination:
                     shutil.copyfileobj(source, destination)
                 found += 1

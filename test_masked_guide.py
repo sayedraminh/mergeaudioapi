@@ -191,3 +191,29 @@ def test_composite_masks_fills_gaps_closed_by_the_person_and_bottom_edge(guide):
     assert pixel(54, 31)[2] > 200  # including the bottom row
     kept = client.post("/composite-masks", headers=HEADERS, json={**body, "fill_holes": False})
     assert frame_pixels(kept.json()["output_path"], 3, 64, 32)(24, 24)[2] > 200
+
+
+def test_composite_masks_unions_two_zips_for_the_same_frames(guide):
+    client, files, tmp, _ = guide
+    video, depth = tmp / "video.mp4", tmp / "depth.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=blue:s=64x32:r=24:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video))
+    ffmpeg("-f", "lavfi", "-i", "color=c=red:s=64x32:r=24:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(depth))
+    left, right = tmp / "left.png", tmp / "right.png"
+    ffmpeg("-f", "lavfi", "-i", "color=c=black:s=64x32", "-vf", "drawbox=x=0:y=0:w=32:h=32:color=white:t=fill,format=gray", "-frames:v", "1", str(left))
+    ffmpeg("-f", "lavfi", "-i", "color=c=black:s=64x32", "-vf", "drawbox=x=32:y=0:w=32:h=32:color=white:t=fill,format=gray", "-frames:v", "1", str(right))
+    for name, mask in (("people.zip", left), ("characters.zip", right)):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.write(mask, "mask_00000.png")
+        (tmp / name).write_bytes(archive.getvalue())
+        files[f"https://example.com/{name}"] = tmp / name
+    files.update({"https://example.com/v.mp4": video, "https://example.com/d.mp4": depth})
+    response = client.post("/composite-masks", headers=HEADERS, json={
+        "video_url": "https://example.com/v.mp4", "depth_url": "https://example.com/d.mp4",
+        "mask_zips": [{"url": "https://example.com/people.zip"}, {"url": "https://example.com/characters.zip"}],
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["masked_frames"] == 1
+    pixel = frame_pixels(response.json()["output_path"], 0, 64, 32)
+    assert pixel(10, 16)[0] > 200 and pixel(54, 16)[0] > 200, "both halves come from the depth video"
+    assert pixel(10, 16)[2] < 100 and pixel(54, 16)[2] < 100
