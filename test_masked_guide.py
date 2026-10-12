@@ -217,3 +217,36 @@ def test_composite_masks_unions_two_zips_for_the_same_frames(guide):
     pixel = frame_pixels(response.json()["output_path"], 0, 64, 32)
     assert pixel(10, 16)[0] > 200 and pixel(54, 16)[0] > 200, "both halves come from the depth video"
     assert pixel(10, 16)[2] < 100 and pixel(54, 16)[2] < 100
+
+
+def test_unpack_masks_refuses_a_playlist_disguised_as_a_png(tmp_path):
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("mask_00000.png", "#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1,\nfile:///etc/passwd\n#EXT-X-ENDLIST\n")
+    masks = tmp_path / "masks"
+    masks.mkdir()
+    with pytest.raises(ValueError, match="not a PNG"):
+        main.unpack_mask_zips([(str(archive), 0)], str(masks), 4)
+
+
+def test_unpack_masks_unions_three_overlapping_zips_in_one_pass_each(tmp_path, monkeypatch):
+    stripes = []
+    for index, x in enumerate((0, 21, 42)):
+        mask = tmp_path / f"stripe{index}.png"
+        ffmpeg("-f", "lavfi", "-i", "color=c=black:s=64x32", "-vf", f"drawbox=x={x}:y=0:w=21:h=32:color=white:t=fill,format=gray", "-frames:v", "1", str(mask))
+        archive = tmp_path / f"stripe{index}.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.write(mask, "mask_00000.png")
+            handle.write(mask, "mask_00001.png")
+        stripes.append((str(archive), 0))
+    runs = []
+    real_run = main.subprocess.run
+    monkeypatch.setattr(main.subprocess, "run", lambda cmd, **kwargs: (runs.append(cmd), real_run(cmd, **kwargs))[1])
+    masks = tmp_path / "masks"
+    masks.mkdir()
+    found, size = main.unpack_mask_zips(stripes, str(masks), 3)
+    assert (found, size) == (2, (64, 32))
+    assert sum("blend=all_mode=lighten" in " ".join(cmd) for cmd in runs) == 2, "one union pass per extra layer"
+    data = subprocess.check_output(["ffmpeg", "-v", "error", "-i", str(masks / "mask_00001.png"), "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+    assert all(data[16 * 64 + x] > 200 for x in (5, 30, 55)), "every stripe survives the union"
+    assert sorted(path.name for path in masks.iterdir()) == ["blank.png", "mask_00000.png", "mask_00001.png", "mask_00002.png"]
