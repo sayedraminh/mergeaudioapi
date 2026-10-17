@@ -264,6 +264,27 @@ def test_composite_worker_drops_border_bands_and_paints_the_ring_with_the_person
     assert pixel(100, 60)[2] > 200, "background beyond the ring stays original"
 
 
+def test_composite_worker_decodes_masks_only_as_png(worker_guide):
+    client, files, tmp, _ = worker_guide
+    video, depth = tmp / "video.mp4", tmp / "depth.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=blue:s=64x32:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video))
+    ffmpeg("-f", "lavfi", "-i", "color=c=red:s=64x32:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(depth))
+    png, bmp = tmp / "mask.png", tmp / "mask.bmp"
+    ffmpeg("-f", "lavfi", "-i", "color=c=white:s=64x32", "-frames:v", "1", str(png))
+    ffmpeg("-f", "lavfi", "-i", "color=c=white:s=64x32", "-frames:v", "1", str(bmp))
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.write(png, "mask_00000.png")
+        # Only the first mask is probed on unpack; a later one in another format must not be decoded.
+        handle.write(bmp, "mask_00001.png")
+    (tmp / "m.zip").write_bytes(archive.getvalue())
+    files.update({"https://example.com/v.mp4": video, "https://example.com/d.mp4": depth, "https://example.com/m.zip": tmp / "m.zip"})
+    response = client.post("/composite-masks", headers=HEADERS, json={
+        "video_url": "https://example.com/v.mp4", "depth_url": "https://example.com/d.mp4", "mask_zips": [{"url": "https://example.com/m.zip"}],
+    })
+    assert response.status_code == 422, response.text
+
+
 def test_unpack_masks_refuses_a_playlist_disguised_as_a_png(tmp_path):
     archive = tmp_path / "evil.zip"
     with zipfile.ZipFile(archive, "w") as handle:

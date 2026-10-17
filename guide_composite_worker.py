@@ -22,6 +22,7 @@ Prints one JSON line: {"frames": n, "masked_frames": n, "dropped_border_pixels":
 import argparse
 import json
 import os
+import struct
 import subprocess
 import sys
 
@@ -36,6 +37,7 @@ BORDER_SLIVER_RADIUS = 0.02
 # A border component hugging the edge for this many times its thickness is a
 # band, not a person cut off by the frame.
 BORDER_BAND_RATIO = 12
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Depth at a mask's very edge blends into the background; colors are sampled
 # this far inside.
 EDGE_INSET = 2
@@ -57,6 +59,21 @@ def reader(path, width, height, frames, video_filter=None):
     finally:
         process.stdout.close()
         process.wait()
+
+
+def read_mask(path, width, height):
+    """Decodes a mask only if it is a PNG of sane size: zip entries are untrusted bytes."""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if data[:8] != PNG_SIGNATURE or data[12:16] != b"IHDR":
+        raise SystemExit(f"{os.path.basename(path)} is not a PNG image")
+    mask_width, mask_height = struct.unpack(">II", data[16:24])
+    if not (0 < mask_width <= 4 * width and 0 < mask_height <= 4 * height):
+        raise SystemExit(f"{os.path.basename(path)} is {mask_width}x{mask_height}, too large for the video")
+    raw = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+    if raw is None:
+        raise SystemExit(f"{os.path.basename(path)} could not be decoded")
+    return raw
 
 
 def drop_stray_pieces(mask):
@@ -147,9 +164,7 @@ def main():
     originals = reader(args.video, width, height, frames)
     depths = reader(args.depth, width, height, frames, f"fps={fps},scale={width}:{height}:flags=bilinear,tpad=stop_mode=clone:stop_duration=1")
     for index, (original, depth) in enumerate(zip(originals, depths)):
-        raw = cv2.imread(os.path.join(args.mask_dir, f"mask_{index:05d}.png"), cv2.IMREAD_GRAYSCALE)
-        if raw is None:
-            raise SystemExit(f"Mask {index} is missing or not an image")
+        raw = read_mask(os.path.join(args.mask_dir, f"mask_{index:05d}.png"), width, height)
         if raw.shape != (height, width):
             raw = cv2.resize(raw, (width, height), interpolation=cv2.INTER_NEAREST)
         mask = np.where(raw > 127, 255, 0).astype(np.uint8)
