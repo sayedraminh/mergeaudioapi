@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import shutil
 import subprocess
 import zipfile
@@ -10,6 +11,9 @@ from fastapi.testclient import TestClient
 import main
 
 HEADERS = {"X-API-Key": "test-key"}
+# Point this at a setup-face-mesh.sh environment to run the composite worker;
+# without it only the FFmpeg composite runs.
+WORKER_PYTHON = os.getenv("FACE_MESH_TEST_PYTHON")
 
 
 def ffmpeg(*args):
@@ -32,8 +36,11 @@ def stream_info(path):
     ]))["streams"]
 
 
-@pytest.fixture
-def guide(tmp_path, monkeypatch):
+@pytest.fixture(params=["ffmpeg", "worker"])
+def guide(request, tmp_path, monkeypatch):
+    if request.param == "worker" and not WORKER_PYTHON:
+        pytest.skip("set FACE_MESH_TEST_PYTHON to run the composite worker")
+    monkeypatch.setattr(main, "FACE_MESH_PYTHON", WORKER_PYTHON if request.param == "worker" else str(tmp_path / "missing-python"))
     files = {}
     output = tmp_path / "output"
     temp = tmp_path / "temp"
@@ -217,6 +224,65 @@ def test_composite_masks_unions_two_zips_for_the_same_frames(guide):
     pixel = frame_pixels(response.json()["output_path"], 0, 64, 32)
     assert pixel(10, 16)[0] > 200 and pixel(54, 16)[0] > 200, "both halves come from the depth video"
     assert pixel(10, 16)[2] < 100 and pixel(54, 16)[2] < 100
+
+
+@pytest.fixture
+def worker_guide(guide):
+    if not WORKER_PYTHON or main.FACE_MESH_PYTHON != WORKER_PYTHON:
+        pytest.skip("runs only on the composite worker")
+    return guide
+
+
+def test_composite_worker_drops_border_bands_and_paints_the_ring_with_the_person(worker_guide):
+    client, files, tmp, _ = worker_guide
+    video, depth = tmp / "video.mp4", tmp / "depth.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=blue:s=128x96:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video))
+    # Depth: the person's side red, the background's green.
+    ffmpeg("-f", "lavfi", "-i", "color=c=green:s=128x96:r=24:d=0.5", "-vf", "drawbox=x=0:y=0:w=80:h=96:color=red:t=fill",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", str(depth))
+    mask = tmp / "mask.png"
+    # A person (x 40-80) standing on the bottom edge, and a 4 px strip down the left edge.
+    ffmpeg("-f", "lavfi", "-i", "color=c=black:s=128x96", "-vf",
+           "drawbox=x=40:y=20:w=40:h=76:color=white:t=fill,drawbox=x=0:y=0:w=4:h=96:color=white:t=fill",
+           "-frames:v", "1", str(mask))
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as handle:
+        for index in range(12):
+            handle.write(mask, f"mask_{index:05d}.png")
+    (tmp / "m.zip").write_bytes(archive.getvalue())
+    files.update({"https://example.com/v.mp4": video, "https://example.com/d.mp4": depth, "https://example.com/m.zip": tmp / "m.zip"})
+    response = client.post("/composite-masks", headers=HEADERS, json={
+        "video_url": "https://example.com/v.mp4", "depth_url": "https://example.com/d.mp4",
+        "mask_zips": [{"url": "https://example.com/m.zip"}], "spread_pixels": 6,
+    })
+    assert response.status_code == 200, response.text
+    pixel = frame_pixels(response.json()["output_path"], 3, 128, 96)
+    assert pixel(2, 48)[2] > 200, "the edge strip is dropped"
+    assert pixel(60, 60)[0] > 200, "depth inside the person"
+    ring = pixel(84, 60)
+    assert ring[0] > 200 and ring[1] < 80, "the grown ring takes the person's depth, not the background's"
+    assert pixel(100, 60)[2] > 200, "background beyond the ring stays original"
+
+
+def test_composite_worker_decodes_masks_only_as_png(worker_guide):
+    client, files, tmp, _ = worker_guide
+    video, depth = tmp / "video.mp4", tmp / "depth.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=blue:s=64x32:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video))
+    ffmpeg("-f", "lavfi", "-i", "color=c=red:s=64x32:r=24:d=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(depth))
+    png, bmp = tmp / "mask.png", tmp / "mask.bmp"
+    ffmpeg("-f", "lavfi", "-i", "color=c=white:s=64x32", "-frames:v", "1", str(png))
+    ffmpeg("-f", "lavfi", "-i", "color=c=white:s=64x32", "-frames:v", "1", str(bmp))
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.write(png, "mask_00000.png")
+        # Only the first mask is probed on unpack; a later one in another format must not be decoded.
+        handle.write(bmp, "mask_00001.png")
+    (tmp / "m.zip").write_bytes(archive.getvalue())
+    files.update({"https://example.com/v.mp4": video, "https://example.com/d.mp4": depth, "https://example.com/m.zip": tmp / "m.zip"})
+    response = client.post("/composite-masks", headers=HEADERS, json={
+        "video_url": "https://example.com/v.mp4", "depth_url": "https://example.com/d.mp4", "mask_zips": [{"url": "https://example.com/m.zip"}],
+    })
+    assert response.status_code == 422, response.text
 
 
 def test_unpack_masks_refuses_a_playlist_disguised_as_a_png(tmp_path):

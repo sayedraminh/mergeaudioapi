@@ -13,6 +13,7 @@ HEADERS = {"X-API-Key": "test-key"}
 # Point these at a setup-face-mesh.sh environment to run the worker for real.
 MESH_PYTHON = os.getenv("FACE_MESH_TEST_PYTHON")
 MESH_MODEL = os.getenv("FACE_MESH_TEST_MODEL")
+MESH_DETECTOR = os.getenv("FACE_MESH_TEST_DETECTOR")
 
 
 def ffmpeg(*args):
@@ -45,11 +46,12 @@ def test_face_mesh_reports_when_it_is_not_installed(mesh, monkeypatch):
     assert "not installed" in response.text
 
 
-@pytest.mark.skipif(not (MESH_PYTHON and MESH_MODEL), reason="set FACE_MESH_TEST_PYTHON and FACE_MESH_TEST_MODEL")
+@pytest.mark.skipif(not (MESH_PYTHON and MESH_MODEL and MESH_DETECTOR), reason="set FACE_MESH_TEST_PYTHON, FACE_MESH_TEST_MODEL and FACE_MESH_TEST_DETECTOR")
 def test_face_mesh_keeps_the_guide_frames_and_audio(mesh, monkeypatch):
     client, files, tmp, temp = mesh
     monkeypatch.setattr(main, "FACE_MESH_PYTHON", MESH_PYTHON)
     monkeypatch.setattr(main, "FACE_MESH_MODEL", MESH_MODEL)
+    monkeypatch.setattr(main, "FACE_DETECTOR_MODEL", MESH_DETECTOR)
     source, guide = tmp / "source.mp4", tmp / "guide.mp4"
     ffmpeg("-f", "lavfi", "-i", "testsrc2=size=128x96:rate=24:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source))
     ffmpeg("-f", "lavfi", "-i", "color=c=red:s=128x96:r=24:d=1", "-f", "lavfi", "-i", "sine=duration=1",
@@ -87,6 +89,7 @@ def test_face_mesh_kills_the_worker_and_its_children_on_timeout(mesh, monkeypatc
     monkeypatch.setattr(main, "FACE_MESH_PYTHON", os.sys.executable)
     monkeypatch.setattr(main, "FACE_MESH_WORKER", str(worker))
     monkeypatch.setattr(main, "FACE_MESH_MODEL", str(model))
+    monkeypatch.setattr(main, "FACE_DETECTOR_MODEL", str(model))
     real_popen = subprocess.Popen
 
     class QuickTimeout(real_popen):

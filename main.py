@@ -2553,6 +2553,35 @@ FILL_HOLES_CHAIN = (
 )
 
 
+# Mask cleanup (specks, border bands, depth-colored ring) needs NumPy
+# and OpenCV, so it runs in the face-mesh environment. Without it the composite
+# falls back to the FFmpeg chain below.
+FACE_MESH_PYTHON = os.getenv("FACE_MESH_PYTHON") or os.path.join(BASE_DIR, ".venv-face", "bin", "python")
+GUIDE_COMPOSITE_WORKER = os.path.join(BASE_DIR, "guide_composite_worker.py")
+
+
+def run_guide_worker(args: List[str], label: str, timeout: int) -> dict:
+    """Runs a worker script in the face-mesh environment and returns its JSON summary line."""
+    # The worker starts its own ffmpeg processes; run it in a new session so a
+    # timeout kills all of them, not just the worker.
+    process = subprocess.Popen(
+        [FACE_MESH_PYTHON, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+    result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+    if result.returncode != 0:
+        raise_media_processing_error(label, result)
+    lines = [line for line in result.stdout.splitlines() if line.startswith("{")]
+    if not lines:
+        raise ValueError(f"{label} worker returned no summary")
+    return json.loads(lines[-1])
+
+
 def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True) -> dict:
     """Depth pixels inside the SAM mask, the original frame everywhere else."""
     source = probe_video_stream(video_path)
@@ -2560,6 +2589,22 @@ def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audi
     fps = round(source["fps"])
     if not frames or not fps:
         raise ValueError("Could not read the normalized video")
+    duration = frames / fps
+    if os.path.isfile(FACE_MESH_PYTHON):
+        args = [
+            GUIDE_COMPOSITE_WORKER, video_path, depth_path, mask_dir, output_path,
+            "--frames", str(frames), "--fps", str(fps), "--width", str(width), "--height", str(height), "--spread", str(spread_pixels),
+        ]
+        if fill_holes:
+            args.append("--fill-holes")
+        if audio_path:
+            args += ["--audio", audio_path]
+        run_guide_worker(args, "Mask composite", 300)
+        validate_rendered_output(output_path)
+        rendered = probe_video_stream(output_path)
+        if rendered["frames"] != frames:
+            raise ValueError(f"Composite has {rendered['frames']} frames, expected {frames}")
+        return {"width": width, "height": height, "fps": fps, "frames": frames, "duration": duration}
     mask_chain = f"scale={width}:{height}:flags=neighbor,format=gray,lut=y='if(gt(val,127),255,0)'"
     if fill_holes:
         mask_chain += f",{FILL_HOLES_CHAIN}"
@@ -2580,7 +2625,6 @@ def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audi
     if audio_path:
         cmd += ["-i", audio_path]
     cmd += ["-filter_complex", filter_complex, "-map", "[video]"]
-    duration = frames / fps
     if audio_path:
         cmd += ["-map", "3:a:0", "-af", f"apad,atrim=duration={duration:.6f}", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
     else:
@@ -2724,13 +2768,13 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
 
 
 # ---------------------------------------------------------------------------
-# Face mesh: track faces on the original clip and draw a 478-point mesh on the
-# guide, for lip and expression timing. Runs face_mesh_worker.py in its own
+# Face mesh: find faces on the original clip (YuNet) and draw a 478-point mesh
+# on the guide, for lip and expression timing. Runs face_mesh_worker.py in its own
 # environment (setup-face-mesh.sh) so MediaPipe and OpenCV stay out of the API's.
 # ---------------------------------------------------------------------------
 
-FACE_MESH_PYTHON = os.getenv("FACE_MESH_PYTHON") or os.path.join(BASE_DIR, ".venv-face", "bin", "python")
 FACE_MESH_MODEL = os.path.join(BASE_DIR, "models", "face_landmarker.task")
+FACE_DETECTOR_MODEL = os.path.join(BASE_DIR, "models", "face_detection_yunet_2023mar.onnx")
 FACE_MESH_WORKER = os.path.join(BASE_DIR, "face_mesh_worker.py")
 
 
@@ -2747,7 +2791,7 @@ class FaceMeshResponse(MergeResponse):
 
 
 def face_mesh_installed() -> bool:
-    return os.path.isfile(FACE_MESH_PYTHON) and os.path.isfile(FACE_MESH_MODEL)
+    return all(os.path.isfile(path) for path in (FACE_MESH_PYTHON, FACE_MESH_MODEL, FACE_DETECTOR_MODEL))
 
 
 def draw_face_mesh(source_path: str, guide_path: str, output_path: str, max_faces: int) -> dict:
@@ -2756,26 +2800,9 @@ def draw_face_mesh(source_path: str, guide_path: str, output_path: str, max_face
         frames = probe_video_stream(path)["frames"]
         if not frames or frames > GUIDE_MAX_FRAMES:
             raise ValueError("Face mesh input frame count is out of range")
-    # The worker starts its own ffmpeg processes; run it in a new session so a
-    # timeout kills all of them, not just the worker.
-    process = subprocess.Popen(
-        [FACE_MESH_PYTHON, FACE_MESH_WORKER, source_path, guide_path, output_path, FACE_MESH_MODEL, "--max-faces", str(max_faces)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-    )
-    try:
-        stdout, stderr = process.communicate(timeout=240)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
-        raise
-    result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
-    if result.returncode != 0:
-        raise_media_processing_error("Face mesh", result)
+    summary = run_guide_worker([FACE_MESH_WORKER, source_path, guide_path, output_path, FACE_MESH_MODEL, "--detector", FACE_DETECTOR_MODEL, "--max-faces", str(max_faces)], "Face mesh", 240)
     validate_rendered_output(output_path)
-    lines = [line for line in result.stdout.splitlines() if line.startswith("{")]
-    if not lines:
-        raise ValueError("Face mesh worker returned no summary")
-    return json.loads(lines[-1])
+    return summary
 
 
 @app.post("/face-mesh", response_model=FaceMeshResponse)
