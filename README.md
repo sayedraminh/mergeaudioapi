@@ -300,12 +300,23 @@ output expires after 120 seconds, so download each one via
    the output is silent. Returns `frames` and `masked_frames`; a zip set with no
    masks at all returns 422.
 
+   With the face-mesh environment installed (below), the composite runs in
+   `guide_composite_worker.py`, which also cleans each mask: it drops specks
+   and thin bands along the frame border (SAM 3 sometimes returns a ragged
+   strip down an edge where nobody is), grows the mask with a round kernel,
+   and paints the grown ring with the person's nearest depth color instead of
+   the background's depth, so the guide has no dark outline. Without that
+   environment the FFmpeg-only composite runs.
+
 ## Face mesh
 
 `POST /face-mesh` `{"video_url": "<normalized clip>", "guide_url": "<composite guide>", "max_faces": 4}`
-tracks faces on the clip with Google's MediaPipe Face Landmarker (478 points)
+finds faces on every frame of the clip with OpenCV's YuNet detector, runs
+Google's MediaPipe Face Landmarker (478 points) on an enlarged crop of each,
 and draws the mesh (lips and eyes highlighted) on the same frames of the guide,
-keeping the guide's audio. Both videos must have the same frame count; the mesh
+keeping the guide's audio. MediaPipe's own detector only finds faces that fill
+much of the frame; YuNet finds small ones. Faces turned more than 60 degrees
+are skipped, since a profile mesh lands on the cheek. Both videos must have the same frame count; the mesh
 is placed by normalized coordinates, so their sizes may differ. Returns
 `frames`, `tracked_frames` and `faces` (the most faces in one frame).
 
@@ -317,7 +328,8 @@ sudo apt install -y libgl1 libegl1 libgles2 libglib2.0-0
 bash setup-face-mesh.sh
 ```
 
-This creates `.venv-face`, installs `mediapipe==1.1.0` and downloads the model
-to `models/face_landmarker.task`. Without them `/face-mesh` returns 503.
-`FACE_MESH_PYTHON` overrides the worker's interpreter. To run the worker in the
-tests, set `FACE_MESH_TEST_PYTHON` and `FACE_MESH_TEST_MODEL`.
+This creates `.venv-face`, installs `mediapipe==1.1.0` and downloads the models
+to `models/face_landmarker.task` and `models/face_detection_yunet_2023mar.onnx`.
+Without them `/face-mesh` returns 503. `FACE_MESH_PYTHON` overrides the worker's
+interpreter. To run the workers in the tests, set `FACE_MESH_TEST_PYTHON`,
+`FACE_MESH_TEST_MODEL` and `FACE_MESH_TEST_DETECTOR`.

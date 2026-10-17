@@ -1,12 +1,19 @@
-"""Draw a face-tracking mesh on a guide video.
+"""Draw a face mesh on a guide video.
 
-Faces are tracked on the ORIGINAL frames (MediaPipe Face Landmarker, 478
-points) and the mesh is drawn on the matching GUIDE frames, where the people
-are hidden, so a video model can follow mouth and expression movement without
-seeing who they are. Runs in its own environment (setup-face-mesh.sh) because
-MediaPipe pulls in OpenCV; main.py calls it as a subprocess.
+Faces are found on the ORIGINAL frames and the mesh is drawn on the matching
+GUIDE frames, where the people are hidden, so a video model can follow mouth
+and expression movement without seeing who they are. Runs in its own
+environment (setup-face-mesh.sh) because MediaPipe pulls in OpenCV; main.py
+calls it as a subprocess.
 
-usage: face_mesh_worker.py SOURCE GUIDE OUTPUT MODEL [--max-faces N]
+MediaPipe's own face detector only finds faces that fill a good part of the
+frame, so on a wide 1280 px shot it missed nearly everyone. Faces are found
+with OpenCV's YuNet, which handles small faces, and the 478-point Face
+Landmarker runs on an enlarged crop of each one. Every frame is detected on
+its own, so nothing carries over a cut. Faces turned past MAX_YAW are left
+out: the mesh of a profile lands on the cheek or the back of the head.
+
+usage: face_mesh_worker.py SOURCE GUIDE OUTPUT MODEL --detector YUNET [--max-faces N]
 Prints one JSON line: {"frames": n, "tracked_frames": n, "faces": max_faces_seen}
 """
 import argparse
@@ -23,6 +30,17 @@ sys.modules.setdefault("sounddevice", types.ModuleType("sounddevice"))
 import cv2  # noqa: E402
 import mediapipe as mp  # noqa: E402
 import numpy as np  # noqa: E402
+
+# YuNet scores below this are not faces.
+DETECT_SCORE = 0.7
+# Each face is cropped this many times its box size and resized to CROP_SIZE
+# for the landmarker.
+CROP_SCALE = 2.2
+CROP_SIZE = 384
+MAX_YAW = 60
+# A face box moving less than this share of its size since the previous frame
+# is averaged with it, which steadies the crop and so the mesh.
+SMOOTH_DISTANCE = 0.25
 
 # RGB: frames are decoded as rgb24.
 TESSELATION = (50, 170, 205)
@@ -53,6 +71,30 @@ def reader(path, width, height):
     process.wait()
 
 
+def steady(box, previous):
+    """Averages a face box with the nearest one from the previous frame when it barely moved."""
+    cx, cy, size = box
+    for px, py, psize in previous:
+        if abs(px - cx) + abs(py - cy) < SMOOTH_DISTANCE * size and abs(psize - size) < SMOOTH_DISTANCE * size:
+            return ((cx + px) / 2, (cy + py) / 2, (size + psize) / 2)
+    return box
+
+
+def landmarks_in_crop(landmarker, frame, cx, cy, side):
+    """478 face points in frame pixels from a square crop around (cx, cy), or None for no face or a profile."""
+    ratio = CROP_SIZE / side
+    transform = np.float32([[ratio, 0, CROP_SIZE / 2 - cx * ratio], [0, ratio, CROP_SIZE / 2 - cy * ratio]])
+    crop = cv2.warpAffine(frame, transform, (CROP_SIZE, CROP_SIZE), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+    result = landmarker.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(crop)))
+    if not result.face_landmarks:
+        return None
+    rotation = np.array(result.facial_transformation_matrixes[0])[:3, :3]
+    if abs(np.degrees(np.arctan2(rotation[0, 2], rotation[2, 2]))) > MAX_YAW:
+        return None
+    left, top = cx - side / 2, cy - side / 2
+    return [(left + point.x * side, top + point.y * side) for point in result.face_landmarks[0]]
+
+
 def main():
     if sys.argv[1:2] == ["--check"]:
         # Loading the landmarker also loads its native libraries (EGL), so a
@@ -61,6 +103,8 @@ def main():
             options = mp.tasks.vision.FaceLandmarkerOptions(base_options=mp.tasks.BaseOptions(model_asset_path=sys.argv[2]))
             with mp.tasks.vision.FaceLandmarker.create_from_options(options):
                 pass
+        if len(sys.argv) > 3:
+            cv2.FaceDetectorYN.create(sys.argv[3], "", (320, 320))
         print(f"face mesh ready: mediapipe {mp.__version__}, opencv {cv2.__version__}")
         return 0
     parser = argparse.ArgumentParser()
@@ -68,6 +112,7 @@ def main():
     parser.add_argument("guide")
     parser.add_argument("output")
     parser.add_argument("model")
+    parser.add_argument("--detector", required=True)
     parser.add_argument("--max-faces", type=int, default=4)
     args = parser.parse_args()
 
@@ -85,13 +130,14 @@ def main():
     ]
     # Thicker lines on large frames so the mesh survives the provider's resize.
     scale = max(1, round(max(gw, gh) / 960))
+    detector = cv2.FaceDetectorYN.create(args.detector, "", (sw, sh), DETECT_SCORE, 0.3, 5000)
     options = mp.tasks.vision.FaceLandmarkerOptions(
         base_options=mp.tasks.BaseOptions(model_asset_path=args.model),
-        running_mode=mp.tasks.vision.RunningMode.VIDEO,
-        num_faces=args.max_faces,
-        min_face_detection_confidence=0.3,
-        min_face_presence_confidence=0.3,
-        min_tracking_confidence=0.3,
+        running_mode=mp.tasks.vision.RunningMode.IMAGE,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        output_facial_transformation_matrixes=True,
     )
     writer = subprocess.Popen([
         "ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{gw}x{gh}", "-r", f"{fps}", "-i", "-",
@@ -101,21 +147,27 @@ def main():
     ], stdin=subprocess.PIPE)
     tracked = 0
     most_faces = 0
+    previous = []
     with mp.tasks.vision.FaceLandmarker.create_from_options(options) as landmarker:
-        for index, (source, guide) in enumerate(zip(reader(args.source, sw, sh), reader(args.guide, gw, gh))):
-            result = landmarker.detect_for_video(
-                mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(source)),
-                round(index * 1000 / fps),
-            )
+        for source, guide in zip(reader(args.source, sw, sh), reader(args.guide, gw, gh)):
+            _, found = detector.detect(cv2.cvtColor(source, cv2.COLOR_RGB2BGR))
+            boxes = [] if found is None else sorted(found.tolist(), key=lambda face: -face[14])[:args.max_faces]
+            boxes = [steady((x + w / 2, y + h / 2, max(w, h)), previous) for x, y, w, h, *_ in boxes]
+            previous = boxes
             frame = guide.copy()
-            if result.face_landmarks:
-                tracked += 1
-                most_faces = max(most_faces, len(result.face_landmarks))
-            for face in result.face_landmarks:
-                points = [(round(point.x * gw), round(point.y * gh)) for point in face]
+            faces = 0
+            for cx, cy, size in boxes:
+                points = landmarks_in_crop(landmarker, source, cx, cy, size * CROP_SCALE)
+                if points is None:
+                    continue
+                faces += 1
+                points = [(round(x * gw / sw), round(y * gh / sh)) for x, y in points]
                 for edges, color, width in groups:
                     for edge in edges:
                         cv2.line(frame, points[edge.start], points[edge.end], color, width * scale, cv2.LINE_AA)
+            if faces:
+                tracked += 1
+                most_faces = max(most_faces, faces)
             writer.stdin.write(frame.tobytes())
     writer.stdin.close()
     if writer.wait() != 0:
