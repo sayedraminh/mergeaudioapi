@@ -9,6 +9,10 @@ Mask cleanup, per frame:
 - Thin bands along the frame border are dropped. SAM 3 sometimes returns a
   ragged strip down an edge where nobody is, which became a depth stripe.
   Specks are dropped too.
+- Far-depth mask pieces lying wholly within a band along the top or side
+  edges are dropped. SAM sometimes gives a person a band of sky or
+  trees along the frame edge, attached to them, which the depth paints black.
+  A person cut off by the frame edge is near, so they stay.
 - Background the mask closes off is filled, counting the bottom edge as
   closed: SAM leaves some clothing (a tie, a bag strap) and, in extreme
   close-ups, the lips out of the person.
@@ -37,6 +41,11 @@ BORDER_SLIVER_RADIUS = 0.02
 # A border component hugging the edge for this many times its thickness is a
 # band, not a person cut off by the frame.
 BORDER_BAND_RATIO = 12
+# How far in from the top and side edges the far-depth check reaches, as a
+# share of the short side, and how much darker (farther) than the person's
+# median depth a pixel must be to count as background.
+EDGE_BAND_SHARE = 0.08
+FAR_DEPTH_RATIO = 0.35
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Depth at a mask's very edge blends into the background; colors are sampled
 # this far inside.
@@ -106,6 +115,36 @@ def drop_stray_pieces(mask):
     return mask, dropped
 
 
+def drop_far_edge_pixels(mask, depth):
+    """Clears far-depth mask pieces that lie wholly within the top or side edge band."""
+    height, width = mask.shape
+    band = max(1, round(EDGE_BAND_SHARE * min(width, height)))
+    near_edge = np.zeros(mask.shape, bool)
+    near_edge[:band] = True
+    near_edge[:, :band] = True
+    near_edge[:, -band:] = True
+    masked = mask > 0
+    if not (masked & near_edge).any():
+        return mask, 0
+    # The depth colors run from black (far) to bright (near), so brightness
+    # orders depth. The colormap isn't linear: the ratio is on brightness, not
+    # on depth. The people's median is the reference, since a detached strip
+    # has no body of its own to compare with.
+    nearness = depth[masked].astype(np.float32).mean(axis=1)
+    far = np.zeros(mask.shape, np.uint8)
+    far[masked] = nearness < FAR_DEPTH_RATIO * float(np.median(nearness))
+    count, labels = cv2.connectedComponents(far, connectivity=8)
+    if count <= 1:
+        return mask, 0
+    # A strip of sky lies wholly inside the band; a far person cut off by the
+    # frame edge reaches past it and stays.
+    inside = np.bincount(labels[near_edge], minlength=count) == np.bincount(labels.ravel(), minlength=count)
+    inside[0] = False
+    drop = inside[labels]
+    mask[drop] = 0
+    return mask, int(drop.sum())
+
+
 def fill_holes(mask):
     """Fills background the mask closes off; the bottom edge counts as closed."""
     background = (mask == 0).astype(np.uint8)
@@ -170,6 +209,13 @@ def main():
         mask = np.where(raw > 127, 255, 0).astype(np.uint8)
         mask, dropped = drop_stray_pieces(mask)
         dropped_total += dropped
+        if mask.any():
+            mask, dropped = drop_far_edge_pixels(mask, depth)
+            dropped_total += dropped
+            if dropped:
+                # A dropped strip's blended rim can be left as a speck.
+                mask, dropped = drop_stray_pieces(mask)
+                dropped_total += dropped
         frame = original
         if mask.any():
             masked += 1
