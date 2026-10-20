@@ -17,10 +17,13 @@ Mask cleanup, per frame:
   closed: SAM leaves some clothing (a tie, a bag strap) and, in extreme
   close-ups, the lips out of the person.
 - With --slim SHARE, each person is drawn narrower: every horizontal run of
-  the mask shrinks toward its middle by SHARE of its width on each side
-  (capped, so an outstretched arm keeps its reach), and the freed edge shows
-  the room, inpainted from the original frame. The video model fills a
-  silhouette's outline, so a stocky original made a slim replacement stocky.
+  the mask shrinks toward its middle by SHARE of how much wider it is than an
+  arm or head (so those keep their width), capped per side, never at a frame
+  edge (that side is a body cut off by the frame), and lightly smoothed. The
+  freed edge shows the room, inpainted from the original frame. The video
+  model fills a silhouette's outline, so a stocky original made a slim
+  replacement stocky. Two people touching in one row are slimmed as one run
+  (masks arrive as one union).
 - The grown ring around each person takes that person's nearest depth color,
   not the background's depth, so the guide has no dark outline.
 
@@ -53,6 +56,9 @@ EDGE_BAND_SHARE = 0.08
 FAR_DEPTH_RATIO = 0.35
 # --slim never takes more than this share of the frame width off one side of a run.
 SLIM_CAP_SHARE = 0.04
+# Runs up to this share of the frame width (an arm, a head) are hardly slimmed:
+# --slim applies to how much wider than this a run is.
+SLIM_FREE_SHARE = 0.1
 # The freed edge is filled from this far around the person.
 SLIM_FILL_MARGIN = 40
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -164,18 +170,25 @@ def fill_holes(mask):
 
 
 def slim_mask(mask, share):
-    """Shrinks every horizontal run of the mask toward its middle by `share` of its width per side."""
+    """Shrinks every horizontal run toward its middle by `share` of its width past SLIM_FREE_SHARE, per side."""
     height, width = mask.shape
     edges = np.diff(np.pad((mask > 0).astype(np.int8), ((0, 0), (1, 1))), axis=1)
     rows, starts = np.nonzero(edges == 1)
     _, ends = np.nonzero(edges == -1)
-    cut = np.minimum(((ends - starts) * share).astype(int), int(SLIM_CAP_SHARE * width))
-    left, right = starts + cut, ends - cut
+    extra = np.maximum(0, (ends - starts) - SLIM_FREE_SHARE * width)
+    cut = np.minimum((extra * share).astype(int), int(SLIM_CAP_SHARE * width))
+    # A side at the frame edge is a body cut off by the frame, not its outline.
+    left = starts + np.where(starts == 0, 0, cut)
+    right = ends - np.where(ends == width, 0, cut)
     keep = right > left
     marks = np.zeros((height, width + 1), np.int32)
     np.add.at(marks, (rows[keep], left[keep]), 1)
     np.add.at(marks, (rows[keep], right[keep]), -1)
-    return np.where(np.cumsum(marks, axis=1)[:, :width] > 0, 255, 0).astype(np.uint8)
+    thin = np.where(np.cumsum(marks, axis=1)[:, :width] > 0, 255, 0).astype(np.uint8)
+    # Each row is cut on its own: smooth the steps where an arm meets the
+    # torso, never growing past the person.
+    smooth = cv2.GaussianBlur(thin, (1, 9), 0) > 127
+    return np.where(smooth & (mask > 0), 255, 0).astype(np.uint8)
 
 
 def paint_room(frame, original, freed, person):
@@ -187,7 +200,10 @@ def paint_room(frame, original, freed, person):
     crop = np.ascontiguousarray(original[y0:y1, x0:x1])
     hide = np.where(person[y0:y1, x0:x1], 255, 0).astype(np.uint8)
     small = (max(1, (x1 - x0) // 2), max(1, (y1 - y0) // 2))
-    patch = cv2.inpaint(cv2.resize(crop, small, interpolation=cv2.INTER_AREA), cv2.resize(hide, small, interpolation=cv2.INTER_NEAREST), 3, cv2.INPAINT_TELEA)
+    # Hidden at half size wherever a person pixel falls into the 2x2 block, plus a
+    # pixel more, so no averaged-in body color is taken for room.
+    hidden = cv2.dilate((cv2.resize(hide, small, interpolation=cv2.INTER_AREA) > 0).astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
+    patch = cv2.inpaint(cv2.resize(crop, small, interpolation=cv2.INTER_AREA), hidden, 3, cv2.INPAINT_TELEA)
     patch = cv2.resize(patch, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
     region = frame[y0:y1, x0:x1]
     region[freed[y0:y1, x0:x1]] = patch[freed[y0:y1, x0:x1]]
@@ -224,6 +240,8 @@ def main():
     parser.add_argument("--slim", type=float, default=0)
     parser.add_argument("--audio")
     args = parser.parse_args()
+    if not 0 <= args.slim <= 0.5:
+        raise SystemExit("--slim must be between 0 and 0.5")
     width, height, frames, fps = args.width, args.height, args.frames, args.fps
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * args.spread + 1, 2 * args.spread + 1)) if args.spread else None
@@ -273,7 +291,7 @@ def main():
                 person = (cv2.dilate(full, kernel) if kernel is not None else full) > 0
                 freed = person & (grown == 0)
                 if freed.any():
-                    frame = paint_room(np.array(frame), original, freed, person)
+                    frame = paint_room(frame, original, freed, person)
         writer.stdin.write(np.ascontiguousarray(frame).tobytes())
     writer.stdin.close()
     if writer.wait() != 0:

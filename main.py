@@ -2335,7 +2335,7 @@ class CompositeMasksRequest(BaseModel):
     fill_holes: bool = True
     # Draw each person this share of every mask row narrower per side, with the
     # room painted over the freed edge (composite worker only). 0 keeps the outline.
-    slim_share: float = Field(default=0, ge=0, le=0.3)
+    slim_share: float = Field(default=0, ge=0, le=0.2)
 
 
 class CompositeMasksResponse(MergeResponse):
