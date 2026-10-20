@@ -11,7 +11,9 @@ frame, so on a wide 1280 px shot it missed nearly everyone. Faces are found
 with OpenCV's YuNet, which handles small faces, and the 478-point Face
 Landmarker runs on an enlarged crop of each one. Every frame is detected on
 its own, so nothing carries over a cut. Faces turned past MAX_YAW are left
-out: the mesh of a profile lands on the cheek or the back of the head.
+out: the mesh of a profile lands on the cheek or the back of the head. Faces
+the guide shows as filmed (it hides only the people being replaced) are left
+out too, so no mesh is drawn onto a real face.
 
 usage: face_mesh_worker.py SOURCE GUIDE OUTPUT MODEL --detector YUNET [--max-faces N]
 Prints one JSON line: {"frames": n, "tracked_frames": n, "faces": max_faces_seen}
@@ -41,6 +43,10 @@ MAX_YAW = 60
 # A face box moving less than this share of its size since the previous frame
 # is averaged with it, which steadies the crop and so the mesh.
 SMOOTH_DISTANCE = 0.25
+
+# A face whose guide pixels differ from the source by less than this (mean, 0-255)
+# is shown as filmed, not hidden under a silhouette, and gets no mesh.
+FILMED_DIFF = 25
 
 # RGB: frames are decoded as rgb24.
 TESSELATION = (50, 170, 205)
@@ -78,6 +84,21 @@ def steady(box, previous):
         if abs(px - cx) + abs(py - cy) < SMOOTH_DISTANCE * size and abs(psize - size) < SMOOTH_DISTANCE * size:
             return ((cx + px) / 2, (cy + py) / 2, (size + psize) / 2)
     return box
+
+
+def hidden(source, guide, cx, cy, size):
+    """True when the guide hides this face under a silhouette. A guide may keep
+    some people as filmed; a mesh on a real face would be drawn into the result."""
+    sh, sw = source.shape[:2]
+    gh, gw = guide.shape[:2]
+    half = max(2, size / 4)
+    x0, x1, y0, y1 = int(max(0, cx - half)), int(min(sw, cx + half)), int(max(0, cy - half)), int(min(sh, cy + half))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    patch = source[y0:y1, x0:x1].astype(np.int16)
+    covered = guide[y0 * gh // sh:max(y0 * gh // sh + 1, y1 * gh // sh), x0 * gw // sw:max(x0 * gw // sw + 1, x1 * gw // sw)]
+    covered = cv2.resize(covered, (x1 - x0, y1 - y0), interpolation=cv2.INTER_AREA).astype(np.int16)
+    return float(np.abs(patch - covered).mean()) >= FILMED_DIFF
 
 
 def landmarks_in_crop(landmarker, frame, cx, cy, side):
@@ -151,7 +172,9 @@ def main():
     with mp.tasks.vision.FaceLandmarker.create_from_options(options) as landmarker:
         for source, guide in zip(reader(args.source, sw, sh), reader(args.guide, gw, gh)):
             _, found = detector.detect(cv2.cvtColor(source, cv2.COLOR_RGB2BGR))
-            boxes = [] if found is None else sorted(found.tolist(), key=lambda face: -face[14])[:args.max_faces]
+            boxes = [] if found is None else sorted(found.tolist(), key=lambda face: -face[14])
+            # Filmed faces never take one of the max_faces slots.
+            boxes = [box for box in boxes if hidden(source, guide, box[0] + box[2] / 2, box[1] + box[3] / 2, max(box[2], box[3]))][:args.max_faces]
             boxes = [steady((x + w / 2, y + h / 2, max(w, h)), previous) for x, y, w, h, *_ in boxes]
             previous = boxes
             frame = guide.copy()
