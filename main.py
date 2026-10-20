@@ -2333,6 +2333,9 @@ class CompositeMasksRequest(BaseModel):
     # leaves some clothing (a tie, a bag strap) out of the person, and the
     # original costume would show through.
     fill_holes: bool = True
+    # Draw each person this share of every mask row narrower per side, with the
+    # room painted over the freed edge (composite worker only). 0 keeps the outline.
+    slim_share: float = Field(default=0, ge=0, le=0.2)
 
 
 class CompositeMasksResponse(MergeResponse):
@@ -2343,6 +2346,8 @@ class CompositeMasksResponse(MergeResponse):
     masked_frames: int
     duration_seconds: float
     has_audio: bool
+    # The slim_share actually drawn: 0 when the FFmpeg fallback ran, which can't slim.
+    slim_share: float = 0
 
 
 # Demuxers that only read the downloaded bytes. Playlist-style formats (hls,
@@ -2582,7 +2587,7 @@ def run_guide_worker(args: List[str], label: str, timeout: int) -> dict:
     return json.loads(lines[-1])
 
 
-def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True) -> dict:
+def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True, slim_share: float = 0) -> dict:
     """Depth pixels inside the SAM mask, the original frame everywhere else."""
     source = probe_video_stream(video_path)
     frames, width, height = source["frames"], source["width"], source["height"]
@@ -2597,6 +2602,8 @@ def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audi
         ]
         if fill_holes:
             args.append("--fill-holes")
+        if slim_share:
+            args += ["--slim", str(slim_share)]
         if audio_path:
             args += ["--audio", audio_path]
         run_guide_worker(args, "Mask composite", 300)
@@ -2604,7 +2611,7 @@ def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audi
         rendered = probe_video_stream(output_path)
         if rendered["frames"] != frames:
             raise ValueError(f"Composite has {rendered['frames']} frames, expected {frames}")
-        return {"width": width, "height": height, "fps": fps, "frames": frames, "duration": duration}
+        return {"width": width, "height": height, "fps": fps, "frames": frames, "duration": duration, "slim_share": slim_share}
     mask_chain = f"scale={width}:{height}:flags=neighbor,format=gray,lut=y='if(gt(val,127),255,0)'"
     if fill_holes:
         mask_chain += f",{FILL_HOLES_CHAIN}"
@@ -2745,7 +2752,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
             masked_frames, _ = await asyncio.to_thread(
                 unpack_mask_zips, [(path, item.start_frame) for item, path in zip(request.mask_zips, zip_paths)], mask_dir, frames,
             )
-            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels, request.fill_holes)
+            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels, request.fill_holes, request.slim_share)
             schedule_file_deletion(output_path)
             completed = True
             return CompositeMasksResponse(
@@ -2753,6 +2760,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
                 processing_time_seconds=round(time.perf_counter() - started, 3),
                 width=meta["width"], height=meta["height"], fps=meta["fps"], frames=meta["frames"],
                 masked_frames=masked_frames, duration_seconds=round(meta["duration"], 6), has_audio=bool(audio_path),
+                slim_share=meta.get("slim_share", 0),
             )
         except MediaProcessingError as error:
             raise HTTPException(status_code=422, detail=error.public_detail())
