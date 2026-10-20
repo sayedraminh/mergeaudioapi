@@ -2346,6 +2346,8 @@ class CompositeMasksResponse(MergeResponse):
     masked_frames: int
     duration_seconds: float
     has_audio: bool
+    # The slim_share actually drawn: 0 when the FFmpeg fallback ran, which can't slim.
+    slim_share: float = 0
 
 
 # Demuxers that only read the downloaded bytes. Playlist-style formats (hls,
@@ -2609,7 +2611,7 @@ def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audi
         rendered = probe_video_stream(output_path)
         if rendered["frames"] != frames:
             raise ValueError(f"Composite has {rendered['frames']} frames, expected {frames}")
-        return {"width": width, "height": height, "fps": fps, "frames": frames, "duration": duration}
+        return {"width": width, "height": height, "fps": fps, "frames": frames, "duration": duration, "slim_share": slim_share}
     mask_chain = f"scale={width}:{height}:flags=neighbor,format=gray,lut=y='if(gt(val,127),255,0)'"
     if fill_holes:
         mask_chain += f",{FILL_HOLES_CHAIN}"
@@ -2758,6 +2760,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
                 processing_time_seconds=round(time.perf_counter() - started, 3),
                 width=meta["width"], height=meta["height"], fps=meta["fps"], frames=meta["frames"],
                 masked_frames=masked_frames, duration_seconds=round(meta["duration"], 6), has_audio=bool(audio_path),
+                slim_share=meta.get("slim_share", 0),
             )
         except MediaProcessingError as error:
             raise HTTPException(status_code=422, detail=error.public_detail())

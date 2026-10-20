@@ -114,11 +114,14 @@ def test_composite_masks_aligns_frames_and_blanks_missing_ones(guide):
     })
     response = client.post("/composite-masks", headers=HEADERS, json={
         "video_url": "https://example.com/video.mp4", "depth_url": "https://example.com/depth.mp4",
-        "mask_zips": [{"url": "https://example.com/masks.zip"}], "audio_url": "https://example.com/audio.wav",
+        "mask_zips": [{"url": "https://example.com/masks.zip"}], "audio_url": "https://example.com/audio.wav", "slim_share": 0.12,
     })
     assert response.status_code == 200, response.text
     result = response.json()
     assert (result["frames"], result["masked_frames"], result["has_audio"]) == (24, 10, True)
+    # Only the composite worker can slim; the response says which one drew the guide.
+    worker = bool(WORKER_PYTHON) and main.FACE_MESH_PYTHON == WORKER_PYTHON
+    assert result["slim_share"] == (0.12 if worker else 0)
     streams = stream_info(result["output_path"])
     assert int(next(s for s in streams if s["codec_type"] == "video")["nb_read_frames"]) == 24
     # Audio is padded to the video length.
