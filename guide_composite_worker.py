@@ -9,6 +9,10 @@ Mask cleanup, per frame:
 - Thin bands along the frame border are dropped. SAM 3 sometimes returns a
   ragged strip down an edge where nobody is, which became a depth stripe.
   Specks are dropped too.
+- Mask pixels near the top or side edges whose depth is far behind the
+  masked people are dropped. SAM sometimes gives a person a band of sky or
+  trees along the frame edge, attached to them, which the depth paints black.
+  A person cut off by the frame edge is near, so they stay.
 - Background the mask closes off is filled, counting the bottom edge as
   closed: SAM leaves some clothing (a tie, a bag strap) and, in extreme
   close-ups, the lips out of the person.
@@ -37,6 +41,11 @@ BORDER_SLIVER_RADIUS = 0.02
 # A border component hugging the edge for this many times its thickness is a
 # band, not a person cut off by the frame.
 BORDER_BAND_RATIO = 12
+# How far in from the top and side edges the far-depth check reaches, as a
+# share of the short side, and how much darker (farther) than the person's
+# median depth a pixel must be to count as background.
+EDGE_BAND_SHARE = 0.08
+FAR_DEPTH_RATIO = 0.35
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Depth at a mask's very edge blends into the background; colors are sampled
 # this far inside.
@@ -106,6 +115,26 @@ def drop_stray_pieces(mask):
     return mask, dropped
 
 
+def drop_far_edge_pixels(mask, depth):
+    """Clears mask pixels near the top or side edges whose depth is far behind the masked people's."""
+    height, width = mask.shape
+    band = max(1, round(EDGE_BAND_SHARE * min(width, height)))
+    near_edge = np.zeros(mask.shape, bool)
+    near_edge[:band] = True
+    near_edge[:, :band] = True
+    near_edge[:, -band:] = True
+    edge = (mask > 0) & near_edge
+    if not edge.any():
+        return mask, 0
+    # The depth colors run from black (far) to bright (near), so brightness
+    # orders depth. The people's median is the reference: a detached strip
+    # has no body of its own to compare with.
+    nearness = depth.astype(np.float32).mean(axis=2)
+    far = edge & (nearness < FAR_DEPTH_RATIO * float(np.median(nearness[mask > 0])))
+    mask[far] = 0
+    return mask, int(far.sum())
+
+
 def fill_holes(mask):
     """Fills background the mask closes off; the bottom edge counts as closed."""
     background = (mask == 0).astype(np.uint8)
@@ -170,6 +199,9 @@ def main():
         mask = np.where(raw > 127, 255, 0).astype(np.uint8)
         mask, dropped = drop_stray_pieces(mask)
         dropped_total += dropped
+        if mask.any():
+            mask, dropped = drop_far_edge_pixels(mask, depth)
+            dropped_total += dropped
         frame = original
         if mask.any():
             masked += 1
