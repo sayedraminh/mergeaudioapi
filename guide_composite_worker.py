@@ -16,11 +16,16 @@ Mask cleanup, per frame:
 - Background the mask closes off is filled, counting the bottom edge as
   closed: SAM leaves some clothing (a tie, a bag strap) and, in extreme
   close-ups, the lips out of the person.
+- With --slim SHARE, each person is drawn narrower: every horizontal run of
+  the mask shrinks toward its middle by SHARE of its width on each side
+  (capped, so an outstretched arm keeps its reach), and the freed edge shows
+  the room, inpainted from the original frame. The video model fills a
+  silhouette's outline, so a stocky original made a slim replacement stocky.
 - The grown ring around each person takes that person's nearest depth color,
   not the background's depth, so the guide has no dark outline.
 
 usage: guide_composite_worker.py VIDEO DEPTH MASK_DIR OUTPUT --frames N --fps F
-       [--spread PX] [--fill-holes] [--audio PATH]
+       [--spread PX] [--fill-holes] [--slim SHARE] [--audio PATH]
 Prints one JSON line: {"frames": n, "masked_frames": n, "dropped_border_pixels": n}
 """
 import argparse
@@ -46,6 +51,10 @@ BORDER_BAND_RATIO = 12
 # median depth a pixel must be to count as background.
 EDGE_BAND_SHARE = 0.08
 FAR_DEPTH_RATIO = 0.35
+# --slim never takes more than this share of the frame width off one side of a run.
+SLIM_CAP_SHARE = 0.04
+# The freed edge is filled from this far around the person.
+SLIM_FILL_MARGIN = 40
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Depth at a mask's very edge blends into the background; colors are sampled
 # this far inside.
@@ -154,6 +163,37 @@ def fill_holes(mask):
     return mask
 
 
+def slim_mask(mask, share):
+    """Shrinks every horizontal run of the mask toward its middle by `share` of its width per side."""
+    height, width = mask.shape
+    edges = np.diff(np.pad((mask > 0).astype(np.int8), ((0, 0), (1, 1))), axis=1)
+    rows, starts = np.nonzero(edges == 1)
+    _, ends = np.nonzero(edges == -1)
+    cut = np.minimum(((ends - starts) * share).astype(int), int(SLIM_CAP_SHARE * width))
+    left, right = starts + cut, ends - cut
+    keep = right > left
+    marks = np.zeros((height, width + 1), np.int32)
+    np.add.at(marks, (rows[keep], left[keep]), 1)
+    np.add.at(marks, (rows[keep], right[keep]), -1)
+    return np.where(np.cumsum(marks, axis=1)[:, :width] > 0, 255, 0).astype(np.uint8)
+
+
+def paint_room(frame, original, freed, person):
+    """Paints the room over `freed`, inpainted at half size from the original frame with the person hidden."""
+    height, width = freed.shape
+    ys, xs = np.nonzero(freed | person)
+    y0, y1 = max(0, ys.min() - SLIM_FILL_MARGIN), min(height, ys.max() + SLIM_FILL_MARGIN + 1)
+    x0, x1 = max(0, xs.min() - SLIM_FILL_MARGIN), min(width, xs.max() + SLIM_FILL_MARGIN + 1)
+    crop = np.ascontiguousarray(original[y0:y1, x0:x1])
+    hide = np.where(person[y0:y1, x0:x1], 255, 0).astype(np.uint8)
+    small = (max(1, (x1 - x0) // 2), max(1, (y1 - y0) // 2))
+    patch = cv2.inpaint(cv2.resize(crop, small, interpolation=cv2.INTER_AREA), cv2.resize(hide, small, interpolation=cv2.INTER_NEAREST), 3, cv2.INPAINT_TELEA)
+    patch = cv2.resize(patch, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+    region = frame[y0:y1, x0:x1]
+    region[freed[y0:y1, x0:x1]] = patch[freed[y0:y1, x0:x1]]
+    return frame
+
+
 def depth_with_ring(depth, mask, grown):
     """Depth inside `grown`; pixels outside the mask's inset core take the nearest core pixel's color."""
     core = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=EDGE_INSET)
@@ -181,6 +221,7 @@ def main():
     parser.add_argument("--height", type=int, required=True)
     parser.add_argument("--spread", type=int, default=0)
     parser.add_argument("--fill-holes", action="store_true")
+    parser.add_argument("--slim", type=float, default=0)
     parser.add_argument("--audio")
     args = parser.parse_args()
     width, height, frames, fps = args.width, args.height, args.frames, args.fps
@@ -221,8 +262,18 @@ def main():
             masked += 1
             if args.fill_holes:
                 mask = fill_holes(mask)
+            full = mask
+            if args.slim:
+                thin = slim_mask(mask, args.slim)
+                mask = thin if thin.any() else mask
             grown = cv2.dilate(mask, kernel) if kernel is not None else mask
             frame = np.where(grown[..., None] > 0, depth_with_ring(depth, mask, grown), original)
+            if args.slim:
+                # The person's own outline, grown like the drawn one, so none of them shows.
+                person = (cv2.dilate(full, kernel) if kernel is not None else full) > 0
+                freed = person & (grown == 0)
+                if freed.any():
+                    frame = paint_room(np.array(frame), original, freed, person)
         writer.stdin.write(np.ascontiguousarray(frame).tobytes())
     writer.stdin.close()
     if writer.wait() != 0:

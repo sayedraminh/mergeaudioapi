@@ -2333,6 +2333,9 @@ class CompositeMasksRequest(BaseModel):
     # leaves some clothing (a tie, a bag strap) out of the person, and the
     # original costume would show through.
     fill_holes: bool = True
+    # Draw each person this share of every mask row narrower per side, with the
+    # room painted over the freed edge (composite worker only). 0 keeps the outline.
+    slim_share: float = Field(default=0, ge=0, le=0.3)
 
 
 class CompositeMasksResponse(MergeResponse):
@@ -2582,7 +2585,7 @@ def run_guide_worker(args: List[str], label: str, timeout: int) -> dict:
     return json.loads(lines[-1])
 
 
-def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True) -> dict:
+def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True, slim_share: float = 0) -> dict:
     """Depth pixels inside the SAM mask, the original frame everywhere else."""
     source = probe_video_stream(video_path)
     frames, width, height = source["frames"], source["width"], source["height"]
@@ -2597,6 +2600,8 @@ def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audi
         ]
         if fill_holes:
             args.append("--fill-holes")
+        if slim_share:
+            args += ["--slim", str(slim_share)]
         if audio_path:
             args += ["--audio", audio_path]
         run_guide_worker(args, "Mask composite", 300)
@@ -2745,7 +2750,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
             masked_frames, _ = await asyncio.to_thread(
                 unpack_mask_zips, [(path, item.start_frame) for item, path in zip(request.mask_zips, zip_paths)], mask_dir, frames,
             )
-            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels, request.fill_holes)
+            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels, request.fill_holes, request.slim_share)
             schedule_file_deletion(output_path)
             completed = True
             return CompositeMasksResponse(
