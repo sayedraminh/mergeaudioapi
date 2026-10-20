@@ -51,9 +51,10 @@ def test_a_far_person_cut_off_by_the_side_edge_stays_whole():
 
 def test_slim_narrows_wide_runs_keeps_arms_and_frame_edges_and_caps():
     # Blocks of 20 identical rows, checked in the middle so the vertical smoothing doesn't matter.
-    mask = np.zeros((80, 1000), np.uint8)
+    mask = np.zeros((100, 1000), np.uint8)
     mask[0:20, 100:400] = 255   # torso: 200 px wider than an arm (100 px free), so 12% of 200 = 24 px a side
     mask[20:40, 0:300] = 255    # cut off by the left edge: only the right side moves
+    mask[80:100, 12:312] = 255  # SAM stopped 12 px short of the edge (within 2% of 1000 = 20 px): same
     mask[40:60, 300:380] = 255  # an 80 px arm or head keeps its width
     mask[60:80, 100:900] = 255  # 12% of 700 = 84 px is capped at 4% of 1000 = 40 px
     out = worker.slim_mask(mask, 0.12)
@@ -61,6 +62,7 @@ def test_slim_narrows_wide_runs_keeps_arms_and_frame_edges_and_caps():
     assert np.flatnonzero(out[30])[[0, -1]].tolist() == [0, 275]
     assert np.flatnonzero(out[50])[[0, -1]].tolist() == [300, 379]
     assert np.flatnonzero(out[70])[[0, -1]].tolist() == [140, 859]
+    assert np.flatnonzero(out[90])[[0, -1]].tolist() == [12, 287]
     assert not (out & ~mask).any(), "slimming never grows the person"
 
 

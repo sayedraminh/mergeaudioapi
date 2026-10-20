@@ -56,6 +56,9 @@ EDGE_BAND_SHARE = 0.08
 FAR_DEPTH_RATIO = 0.35
 # --slim never takes more than this share of the frame width off one side of a run.
 SLIM_CAP_SHARE = 0.04
+# A run side this close to a frame edge (share of the width, at least 8 px) is
+# taken as cut off by the frame and not slimmed.
+SLIM_EDGE_SHARE = 0.02
 # Runs up to this share of the frame width (an arm, a head) are hardly slimmed:
 # --slim applies to how much wider than this a run is.
 SLIM_FREE_SHARE = 0.1
@@ -178,8 +181,10 @@ def slim_mask(mask, share):
     extra = np.maximum(0, (ends - starts) - SLIM_FREE_SHARE * width)
     cut = np.minimum((extra * share).astype(int), int(SLIM_CAP_SHARE * width))
     # A side at the frame edge is a body cut off by the frame, not its outline.
-    left = starts + np.where(starts == 0, 0, cut)
-    right = ends - np.where(ends == width, 0, cut)
+    # SAM often stops a few pixels short of the edge, so near counts too.
+    near = max(8, round(SLIM_EDGE_SHARE * width))
+    left = starts + np.where(starts <= near, 0, cut)
+    right = ends - np.where(ends >= width - near, 0, cut)
     keep = right > left
     marks = np.zeros((height, width + 1), np.int32)
     np.add.at(marks, (rows[keep], left[keep]), 1)
