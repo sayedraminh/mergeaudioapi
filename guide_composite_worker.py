@@ -212,6 +212,10 @@ def main():
         if mask.any():
             mask, dropped = drop_far_edge_pixels(mask, depth)
             dropped_total += dropped
+            if dropped:
+                # A dropped strip's blended rim can be left as a speck.
+                mask, dropped = drop_stray_pieces(mask)
+                dropped_total += dropped
         frame = original
         if mask.any():
             masked += 1
