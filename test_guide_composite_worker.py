@@ -38,3 +38,12 @@ def test_a_far_person_in_the_middle_of_the_frame_is_not_touched():
     mask[80:120, 20:30] = 255  # dark depth, but away from the edges
     out, dropped = worker.drop_far_edge_pixels(mask.copy(), depth)
     assert dropped == 0
+
+
+def test_a_far_person_cut_off_by_the_side_edge_stays_whole():
+    mask, depth = frame()
+    # A passer-by far behind the subject, cut off by the left edge but reaching past the band.
+    mask[60:180, 0:40] = 255
+    depth[60:180, 0:40] = 40
+    out, dropped = worker.drop_far_edge_pixels(mask.copy(), depth)
+    assert dropped == 0 and out[60:180, 0:40].all()
