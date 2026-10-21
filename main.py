@@ -2321,10 +2321,17 @@ class MaskZip(BaseModel):
     start_frame: int = Field(default=0, ge=0, le=GUIDE_MAX_FRAMES)
 
 
+# One zip per SAM section and prompt. Nsketch plans at most 10 shots, and one
+# shot over 15 s splits in two, so 11 sections, each with up to 2 prompts
+# ("person", "character"). Zips on different frames share a layer, so more
+# zips cost downloads, not extra FFmpeg passes.
+MAX_MASK_ZIPS = 22
+
+
 class CompositeMasksRequest(BaseModel):
     video_url: HttpUrl
     depth_url: HttpUrl
-    mask_zips: List[MaskZip] = Field(min_length=1, max_length=8)
+    mask_zips: List[MaskZip] = Field(min_length=1, max_length=MAX_MASK_ZIPS)
     audio_url: Optional[HttpUrl] = None
     # Grow each mask by roughly this many pixels so the silhouette carries less
     # of the original body shape. 0 keeps SAM's exact outline.
