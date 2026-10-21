@@ -229,6 +229,29 @@ def test_composite_masks_unions_two_zips_for_the_same_frames(guide):
     assert pixel(10, 16)[2] < 100 and pixel(54, 16)[2] < 100
 
 
+def test_composite_masks_takes_two_prompts_for_every_section(guide):
+    # Nsketch sends one zip per SAM section and prompt: 11 sections x 2 prompts.
+    client, files, tmp, _ = guide
+    video, depth = tmp / "video.mp4", tmp / "depth.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=blue:s=64x32:r=24:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video))
+    ffmpeg("-f", "lavfi", "-i", "color=c=red:s=64x32:r=24:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(depth))
+    mask = tmp / "mask.png"
+    ffmpeg("-f", "lavfi", "-i", "color=c=white:s=64x32", "-frames:v", "1", str(mask))
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.write(mask, "mask_00000.png")
+    (tmp / "m.zip").write_bytes(archive.getvalue())
+    files.update({"https://example.com/v.mp4": video, "https://example.com/d.mp4": depth, "https://example.com/m.zip": tmp / "m.zip"})
+    zips = [{"url": "https://example.com/m.zip", "start_frame": section} for section in range(11) for _prompt in range(2)]
+    body = {"video_url": "https://example.com/v.mp4", "depth_url": "https://example.com/d.mp4"}
+    assert len(zips) == main.MAX_MASK_ZIPS
+    response = client.post("/composite-masks", headers=HEADERS, json={**body, "mask_zips": zips})
+    assert response.status_code == 200, response.text
+    assert response.json()["masked_frames"] == 11
+    response = client.post("/composite-masks", headers=HEADERS, json={**body, "mask_zips": [*zips, zips[0]]})
+    assert response.status_code == 422
+
+
 @pytest.fixture
 def worker_guide(guide):
     if not WORKER_PYTHON or main.FACE_MESH_PYTHON != WORKER_PYTHON:
