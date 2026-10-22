@@ -2330,7 +2330,8 @@ MAX_MASK_ZIPS = 22
 
 class CompositeMasksRequest(BaseModel):
     video_url: HttpUrl
-    depth_url: HttpUrl
+    # Without a depth video the people are drawn flat gray: SAM's outline alone.
+    depth_url: Optional[HttpUrl] = None
     mask_zips: List[MaskZip] = Field(min_length=1, max_length=MAX_MASK_ZIPS)
     audio_url: Optional[HttpUrl] = None
     # Grow each mask by roughly this many pixels so the silhouette carries less
@@ -2594,8 +2595,8 @@ def run_guide_worker(args: List[str], label: str, timeout: int) -> dict:
     return json.loads(lines[-1])
 
 
-def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True, slim_share: float = 0) -> dict:
-    """Depth pixels inside the SAM mask, the original frame everywhere else."""
+def composite_depth_people(video_path: str, depth_path: Optional[str], mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True, slim_share: float = 0) -> dict:
+    """Depth (or flat gray without a depth video) inside the SAM mask, the original frame everywhere else."""
     source = probe_video_stream(video_path)
     frames, width, height = source["frames"], source["width"], source["height"]
     fps = round(source["fps"])
@@ -2604,9 +2605,11 @@ def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audi
     duration = frames / fps
     if os.path.isfile(FACE_MESH_PYTHON):
         args = [
-            GUIDE_COMPOSITE_WORKER, video_path, depth_path, mask_dir, output_path,
+            GUIDE_COMPOSITE_WORKER, video_path, mask_dir, output_path,
             "--frames", str(frames), "--fps", str(fps), "--width", str(width), "--height", str(height), "--spread", str(spread_pixels),
         ]
+        if depth_path:
+            args += ["--depth", depth_path]
         if fill_holes:
             args.append("--fill-holes")
         if slim_share:
@@ -2632,8 +2635,10 @@ def composite_depth_people(video_path: str, depth_path: str, mask_dir: str, audi
         f"[2:v]{mask_chain},format=gbrp[mask];"
         "[original][depth][mask]maskedmerge,format=yuv420p[video]"
     )
+    # The worker's flat gray (126) when there is no depth video.
+    depth_input = ["-i", depth_path] if depth_path else ["-f", "lavfi", "-i", f"color=c=0x7e7e7e:s={width}x{height}:r={fps}:d={duration:.6f}"]
     cmd = [
-        "ffmpeg", "-y", "-i", video_path, "-i", depth_path,
+        "ffmpeg", "-y", "-i", video_path, *depth_input,
         "-framerate", str(fps), "-i", os.path.join(mask_dir, "mask_%05d.png"),
     ]
     if audio_path:
@@ -2731,20 +2736,22 @@ async def pitch_audio_endpoint(request: PitchAudioRequest, _: bool = Depends(ver
 
 @app.post("/composite-masks", response_model=CompositeMasksResponse)
 async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Depends(verify_api_key)):
-    """Lay the depth video's people (SAM 3 masks) over the normalized original; optionally embed audio."""
+    """Lay the SAM 3 masked people, depth-colored or flat gray, over the normalized original; optionally embed audio."""
     import shutil
     async with processing_semaphore:
         started = time.perf_counter()
         session_id = uuid.uuid4().hex
         video_path = os.path.join(TEMP_DIR, f"composite_video_{session_id}")
-        depth_path = os.path.join(TEMP_DIR, f"composite_depth_{session_id}")
+        depth_path = os.path.join(TEMP_DIR, f"composite_depth_{session_id}") if request.depth_url else None
         audio_path = os.path.join(TEMP_DIR, f"composite_audio_{session_id}") if request.audio_url else None
         zip_paths = [os.path.join(TEMP_DIR, f"composite_masks_{session_id}_{index}.zip") for index in range(len(request.mask_zips))]
         mask_dir = os.path.join(TEMP_DIR, f"composite_masks_{session_id}")
         output_path = os.path.join(OUTPUT_DIR, f"composite_{session_id}.mp4")
         completed = False
         try:
-            downloads = [download_file(str(request.video_url), video_path), download_file(str(request.depth_url), depth_path)]
+            downloads = [download_file(str(request.video_url), video_path)]
+            if depth_path:
+                downloads.append(download_file(str(request.depth_url), depth_path))
             downloads += [download_file(str(item.url), path) for item, path in zip(request.mask_zips, zip_paths)]
             if audio_path:
                 downloads.append(download_file(str(request.audio_url), audio_path))
@@ -2763,7 +2770,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
             schedule_file_deletion(output_path)
             completed = True
             return CompositeMasksResponse(
-                success=True, message="Depth people composited over the original", output_path=output_path,
+                success=True, message="People composited over the original", output_path=output_path,
                 processing_time_seconds=round(time.perf_counter() - started, 3),
                 width=meta["width"], height=meta["height"], fps=meta["fps"], frames=meta["frames"],
                 masked_frames=masked_frames, duration_seconds=round(meta["duration"], 6), has_audio=bool(audio_path),

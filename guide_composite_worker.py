@@ -1,6 +1,6 @@
-"""Composite a depth guide: depth people over the original frames.
+"""Composite a guide: depth (or flat gray) people over the original frames.
 
-Reads the normalized clip, its depth video and one SAM mask PNG per frame,
+Reads the normalized clip, optionally its depth video, and one SAM mask PNG per frame,
 cleans each mask and writes the guide. Runs in the face-mesh environment
 (setup-face-mesh.sh) because it needs NumPy and OpenCV; main.py calls it as a
 subprocess and falls back to its FFmpeg-only composite without it.
@@ -12,7 +12,8 @@ Mask cleanup, per frame:
 - Far-depth mask pieces lying wholly within a band along the top or side
   edges are dropped. SAM sometimes gives a person a band of sky or
   trees along the frame edge, attached to them, which the depth paints black.
-  A person cut off by the frame edge is near, so they stay.
+  A person cut off by the frame edge is near, so they stay. Without a depth
+  video this step is skipped.
 - Background the mask closes off is filled, counting the bottom edge as
   closed: SAM leaves some clothing (a tie, a bag strap) and, in extreme
   close-ups, the lips out of the person.
@@ -25,13 +26,15 @@ Mask cleanup, per frame:
   replacement stocky. Two people touching in one row are slimmed as one run
   (masks arrive as one union).
 - The grown ring around each person takes that person's nearest depth color,
-  not the background's depth, so the guide has no dark outline.
+  not the background's depth, so the guide has no dark outline. Without a
+  depth video, people and ring are one flat gray.
 
-usage: guide_composite_worker.py VIDEO DEPTH MASK_DIR OUTPUT --frames N --fps F
-       [--spread PX] [--fill-holes] [--slim SHARE] [--audio PATH]
+usage: guide_composite_worker.py VIDEO MASK_DIR OUTPUT --frames N --fps F
+       [--depth PATH] [--spread PX] [--fill-holes] [--slim SHARE] [--audio PATH]
 Prints one JSON line: {"frames": n, "masked_frames": n, "dropped_border_pixels": n}
 """
 import argparse
+import itertools
 import json
 import os
 import struct
@@ -65,6 +68,8 @@ SLIM_FREE_SHARE = 0.1
 # The freed edge is filled from this far around the person.
 SLIM_FILL_MARGIN = 40
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# The people's color when no depth video is given: SAM's outline alone.
+FLAT_FILL = np.full(3, 126, np.uint8)
 # Depth at a mask's very edge blends into the background; colors are sampled
 # this far inside.
 EDGE_INSET = 2
@@ -233,7 +238,6 @@ def depth_with_ring(depth, mask, grown):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("video")
-    parser.add_argument("depth")
     parser.add_argument("mask_dir")
     parser.add_argument("output")
     parser.add_argument("--frames", type=int, required=True)
@@ -244,6 +248,7 @@ def main():
     parser.add_argument("--fill-holes", action="store_true")
     parser.add_argument("--slim", type=float, default=0)
     parser.add_argument("--audio")
+    parser.add_argument("--depth")
     args = parser.parse_args()
     if not 0 <= args.slim <= 0.5:
         raise SystemExit("--slim must be between 0 and 0.5")
@@ -265,7 +270,7 @@ def main():
     masked = 0
     dropped_total = 0
     originals = reader(args.video, width, height, frames)
-    depths = reader(args.depth, width, height, frames, f"fps={fps},scale={width}:{height}:flags=bilinear,tpad=stop_mode=clone:stop_duration=1")
+    depths = reader(args.depth, width, height, frames, f"fps={fps},scale={width}:{height}:flags=bilinear,tpad=stop_mode=clone:stop_duration=1") if args.depth else itertools.repeat(None)
     for index, (original, depth) in enumerate(zip(originals, depths)):
         raw = read_mask(os.path.join(args.mask_dir, f"mask_{index:05d}.png"), width, height)
         if raw.shape != (height, width):
@@ -273,7 +278,7 @@ def main():
         mask = np.where(raw > 127, 255, 0).astype(np.uint8)
         mask, dropped = drop_stray_pieces(mask)
         dropped_total += dropped
-        if mask.any():
+        if mask.any() and depth is not None:
             mask, dropped = drop_far_edge_pixels(mask, depth)
             dropped_total += dropped
             if dropped:
@@ -290,7 +295,8 @@ def main():
                 thin = slim_mask(mask, args.slim)
                 mask = thin if thin.any() else mask
             grown = cv2.dilate(mask, kernel) if kernel is not None else mask
-            frame = np.where(grown[..., None] > 0, depth_with_ring(depth, mask, grown), original)
+            fill = FLAT_FILL if depth is None else depth_with_ring(depth, mask, grown)
+            frame = np.where(grown[..., None] > 0, fill, original)
             if args.slim:
                 # The person's own outline, grown like the drawn one, so none of them shows.
                 person = (cv2.dilate(full, kernel) if kernel is not None else full) > 0

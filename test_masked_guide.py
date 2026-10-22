@@ -134,6 +134,29 @@ def test_composite_masks_aligns_frames_and_blanks_missing_ones(guide):
     assert list(temp.iterdir()) == []
 
 
+def test_composite_masks_without_depth_draws_people_flat_gray(guide):
+    client, files, tmp, temp = guide
+    video = tmp / "video.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=blue:s=64x32:r=24:d=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video))
+    mask = tmp / "mask.png"
+    ffmpeg("-f", "lavfi", "-i", "color=c=black:s=64x32", "-vf", "drawbox=x=0:y=0:w=32:h=32:color=white:t=fill", "-frames:v", "1", str(mask))
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w") as handle:
+        for index in range(24):
+            handle.write(mask, f"masks/mask_{index:05d}.png")
+    (tmp / "masks.zip").write_bytes(archive.getvalue())
+    files.update({"https://example.com/video.mp4": video, "https://example.com/masks.zip": tmp / "masks.zip"})
+    response = client.post("/composite-masks", headers=HEADERS, json={
+        "video_url": "https://example.com/video.mp4", "mask_zips": [{"url": "https://example.com/masks.zip"}],
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["frames"] == 24
+    pixel = frame_pixels(response.json()["output_path"], 5, 64, 32)
+    assert all(abs(channel - 126) < 12 for channel in pixel(8, 16))  # flat gray inside the mask
+    assert pixel(56, 16)[2] > 200  # original (blue) outside
+    assert list(temp.iterdir()) == []
+
+
 def test_composite_masks_offsets_later_zips_and_rejects_empty_masks(guide):
     client, files, tmp, _ = guide
     video, depth = tmp / "video.mp4", tmp / "depth.mp4"
