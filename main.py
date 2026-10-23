@@ -2304,6 +2304,21 @@ class NormalizeVideoResponse(MergeResponse):
     has_audio: bool
 
 
+class CompressVideoRequest(BaseModel):
+    video_url: HttpUrl
+    max_bytes: int = Field(default=10 * 1024 * 1024, ge=1024 * 1024, le=100 * 1024 * 1024)
+    max_short_side: int = Field(default=1080, ge=240, le=2160)
+
+
+class CompressVideoResponse(MergeResponse):
+    size_bytes: int
+    duration_seconds: float
+    width: int
+    height: int
+    has_audio: bool
+    mode: str
+
+
 class PitchAudioRequest(BaseModel):
     audio_url: HttpUrl
     semitones: float = Field(default=3, ge=-12, le=12, allow_inf_nan=False)
@@ -2861,6 +2876,96 @@ async def face_mesh_endpoint(request: FaceMeshRequest, _: bool = Depends(verify_
             raise HTTPException(status_code=422, detail="Face mesh timed out")
         finally:
             cleanup_files([source_path, guide_path, None if completed else output_path])
+
+
+COMPRESS_MAX_SECONDS = 60
+COMPRESS_AUDIO_BITRATE = 128_000
+COMPRESS_MIN_VIDEO_BITRATE = 500_000
+# Room for the MP4 container and encoder overshoot.
+COMPRESS_TARGET_SHARE = 0.92
+COMPRESS_MEDIA_FORMATS = SAFE_MEDIA_FORMATS | {"avi"}
+
+
+def run_compress_step(cmd: List[str], operation: str) -> None:
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    if result.returncode != 0:
+        raise_media_processing_error(operation, result)
+
+
+def compress_video_to_size(input_path: str, output_path: str, max_bytes: int, max_short_side: int) -> dict:
+    """Fit a video under max_bytes with as little visible loss as possible.
+
+    The first encode is visually lossless (x264 CRF 18) with the short side capped at
+    max_short_side. Only a clip that is still too big gets a two-pass encode at the
+    highest bitrate that fits.
+    """
+    formats = set(subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries", "format=format_name", "-of", "csv=p=0", input_path,
+    ], capture_output=True, text=True, timeout=60).stdout.strip().strip("\"").split(","))
+    if not formats or not formats <= COMPRESS_MEDIA_FORMATS:
+        raise ValueError("Unsupported media format")
+    duration = get_media_duration(input_path)
+    if not math.isfinite(duration) or duration <= 0 or duration > COMPRESS_MAX_SECONDS:
+        raise ValueError(f"Video must be at most {COMPRESS_MAX_SECONDS} seconds")
+    has_audio = has_audio_stream(input_path)
+    short_side = lambda side: f"trunc(min({max_short_side},{side})/2)*2"
+    scale = f"scale=w='if(lte(iw,ih),{short_side('iw')},-2)':h='if(lte(iw,ih),-2,{short_side('ih')})'"
+    video = ["ffmpeg", "-y", "-i", input_path, "-map", "0:v:0", "-vf", scale, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium"]
+    audio = ["-map", "0:a:0", "-c:a", "aac", "-b:a", str(COMPRESS_AUDIO_BITRATE)] if has_audio else ["-an"]
+    output = [*audio, "-movflags", "+faststart", output_path]
+    target = int(max_bytes * COMPRESS_TARGET_SHARE)
+
+    run_compress_step([*video, "-crf", "18", *output], "Video compression")
+    mode = "crf"
+    if os.path.getsize(output_path) > target:
+        bitrate = int(target * 8 / duration - (COMPRESS_AUDIO_BITRATE if has_audio else 0))
+        if bitrate < COMPRESS_MIN_VIDEO_BITRATE:
+            raise ValueError("Video is too long to fit the size limit")
+        pass_log = f"{output_path}.pass"
+        try:
+            run_compress_step([*video, "-b:v", str(bitrate), "-pass", "1", "-passlogfile", pass_log, "-an", "-f", "null", "-"], "Video compression")
+            run_compress_step([*video, "-b:v", str(bitrate), "-pass", "2", "-passlogfile", pass_log, *output], "Video compression")
+        finally:
+            cleanup_files([f"{pass_log}-0.log", f"{pass_log}-0.log.mbtree"])
+        mode = "bitrate"
+    validate_rendered_output(output_path)
+    size = os.path.getsize(output_path)
+    if size > max_bytes:
+        raise ValueError("Could not fit the video under the size limit")
+    width, height = get_video_dimensions(output_path)
+    return {"size": size, "duration": get_media_duration(output_path), "width": width, "height": height, "has_audio": has_audio, "mode": mode}
+
+
+@app.post("/compress-video", response_model=CompressVideoResponse)
+async def compress_video_endpoint(request: CompressVideoRequest, _: bool = Depends(verify_api_key)):
+    """Shrink a video under max_bytes for providers with an upload limit (H.264 MP4, short side capped)."""
+    async with processing_semaphore:
+        started = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        input_path = os.path.join(TEMP_DIR, f"compress_input_{session_id}")
+        output_path = os.path.join(OUTPUT_DIR, f"compressed_{session_id}.mp4")
+        completed = False
+        try:
+            await download_file(str(request.video_url), input_path)
+            meta = await asyncio.to_thread(compress_video_to_size, input_path, output_path, request.max_bytes, request.max_short_side)
+            schedule_file_deletion(output_path)
+            completed = True
+            return CompressVideoResponse(
+                success=True, message="Video compressed", output_path=output_path,
+                processing_time_seconds=round(time.perf_counter() - started, 3),
+                size_bytes=meta["size"], duration_seconds=round(meta["duration"], 3),
+                width=meta["width"], height=meta["height"], has_audio=meta["has_audio"], mode=meta["mode"],
+            )
+        except MediaProcessingError as error:
+            raise HTTPException(status_code=422, detail=error.public_detail())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+        except httpx.HTTPError:
+            raise HTTPException(status_code=400, detail="Failed to download video")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=422, detail="Video compression timed out")
+        finally:
+            cleanup_files([input_path, None if completed else output_path])
 
 
 @app.get("/download/{filename}")

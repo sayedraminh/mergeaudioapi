@@ -12,6 +12,7 @@ A FastAPI server that merges multiple videos and adds an audio track with automa
 - Trim videos (`/trim`)
 - Prepare silent grayscale depth guides with source timing (`/prepare-depth`)
 - Build masked depth guides for character swaps (`/normalize-video`, `/pitch-audio`, `/composite-masks`, `/face-mesh`)
+- Shrink a video under a size limit for providers with upload caps (`/compress-video`)
 - Reverse videos (`/reverse`)
 - Speed up or slow down videos (`/speed`)
 - Extract the 5th frame of a video as a PNG (`/extract-fifth-frame`)
