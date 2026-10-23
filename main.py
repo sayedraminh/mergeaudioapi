@@ -2883,7 +2883,6 @@ COMPRESS_AUDIO_BITRATE = 128_000
 COMPRESS_MIN_VIDEO_BITRATE = 500_000
 # Room for the MP4 container and encoder overshoot.
 COMPRESS_TARGET_SHARE = 0.92
-COMPRESS_MEDIA_FORMATS = SAFE_MEDIA_FORMATS | {"avi"}
 
 
 def run_compress_step(cmd: List[str], operation: str) -> None:
@@ -2899,18 +2898,15 @@ def compress_video_to_size(input_path: str, output_path: str, max_bytes: int, ma
     max_short_side. Only a clip that is still too big gets a two-pass encode at the
     highest bitrate that fits.
     """
-    formats = set(subprocess.run([
-        "ffprobe", "-v", "error", "-show_entries", "format=format_name", "-of", "csv=p=0", input_path,
-    ], capture_output=True, text=True, timeout=60).stdout.strip().strip("\"").split(","))
-    if not formats or not formats <= COMPRESS_MEDIA_FORMATS:
-        raise ValueError("Unsupported media format")
+    assert_safe_media(input_path)
     duration = get_media_duration(input_path)
     if not math.isfinite(duration) or duration <= 0 or duration > COMPRESS_MAX_SECONDS:
         raise ValueError(f"Video must be at most {COMPRESS_MAX_SECONDS} seconds")
     has_audio = has_audio_stream(input_path)
     short_side = lambda side: f"trunc(min({max_short_side},{side})/2)*2"
     scale = f"scale=w='if(lte(iw,ih),{short_side('iw')},-2)':h='if(lte(iw,ih),-2,{short_side('ih')})'"
-    video = ["ffmpeg", "-y", "-i", input_path, "-map", "0:v:0", "-vf", scale, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium"]
+    # -t enforces the length cap even when the container reports a false duration.
+    video = ["ffmpeg", "-y", "-i", input_path, "-t", str(COMPRESS_MAX_SECONDS), "-map", "0:v:0", "-vf", scale, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium"]
     audio = ["-map", "0:a:0", "-c:a", "aac", "-b:a", str(COMPRESS_AUDIO_BITRATE)] if has_audio else ["-an"]
     output = [*audio, "-movflags", "+faststart", output_path]
     target = int(max_bytes * COMPRESS_TARGET_SHARE)
