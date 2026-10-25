@@ -1,4 +1,5 @@
-"""Composite a guide: depth (or flat gray) people over the original frames.
+"""Composite a guide: depth (or flat gray) people over the original frames, or
+flat gray people over the depth video (--depth-background).
 
 Reads the normalized clip, optionally its depth video, and one SAM mask PNG per frame,
 cleans each mask and writes the guide. Runs in the face-mesh environment
@@ -28,9 +29,15 @@ Mask cleanup, per frame:
 - The grown ring around each person takes that person's nearest depth color,
   not the background's depth, so the guide has no dark outline. Without a
   depth video, people and ring are one flat gray.
+- With --depth-background the people are flat gray and everything else is the
+  depth video, so the video model rebuilds the whole scene, not only the
+  people: a filmed background kept the phone footage's soft, flat look. Depth
+  Anything also draws the hidden people, with their hair and loose strands, so
+  a band around each silhouette (and the edge --slim frees) is painted over
+  from the depth around it.
 
 usage: guide_composite_worker.py VIDEO MASK_DIR OUTPUT --frames N --fps F
-       [--depth PATH] [--spread PX] [--fill-holes] [--slim SHARE] [--audio PATH]
+       [--depth PATH [--depth-background]] [--spread PX] [--fill-holes] [--slim SHARE] [--audio PATH]
 Prints one JSON line: {"frames": n, "masked_frames": n, "dropped_border_pixels": n}
 """
 import argparse
@@ -67,6 +74,9 @@ SLIM_EDGE_SHARE = 0.02
 SLIM_FREE_SHARE = 0.1
 # The freed edge is filled from this far around the person.
 SLIM_FILL_MARGIN = 40
+# --depth-background: how far past the drawn silhouette the depth video's own
+# outline of the hidden person is painted over.
+DEPTH_HALO_PIXELS = 6
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # The people's color when no depth video is given: SAM's outline alone.
 FLAT_FILL = np.full(3, 126, np.uint8)
@@ -249,12 +259,16 @@ def main():
     parser.add_argument("--slim", type=float, default=0)
     parser.add_argument("--audio")
     parser.add_argument("--depth")
+    parser.add_argument("--depth-background", action="store_true")
     args = parser.parse_args()
     if not 0 <= args.slim <= 0.5:
         raise SystemExit("--slim must be between 0 and 0.5")
+    if args.depth_background and not args.depth:
+        raise SystemExit("--depth-background needs --depth")
     width, height, frames, fps = args.width, args.height, args.frames, args.fps
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * args.spread + 1, 2 * args.spread + 1)) if args.spread else None
+    halo = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * DEPTH_HALO_PIXELS + 1, 2 * DEPTH_HALO_PIXELS + 1))
     command = [
         "ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
     ]
@@ -285,7 +299,8 @@ def main():
                 # A dropped strip's blended rim can be left as a speck.
                 mask, dropped = drop_stray_pieces(mask)
                 dropped_total += dropped
-        frame = original
+        backdrop = depth if args.depth_background else original
+        frame = backdrop
         if mask.any():
             masked += 1
             if args.fill_holes:
@@ -295,14 +310,16 @@ def main():
                 thin = slim_mask(mask, args.slim)
                 mask = thin if thin.any() else mask
             grown = cv2.dilate(mask, kernel) if kernel is not None else mask
-            fill = FLAT_FILL if depth is None else depth_with_ring(depth, mask, grown)
-            frame = np.where(grown[..., None] > 0, fill, original)
-            if args.slim:
+            fill = FLAT_FILL if depth is None or args.depth_background else depth_with_ring(depth, mask, grown)
+            frame = np.where(grown[..., None] > 0, fill, backdrop)
+            if args.slim or args.depth_background:
                 # The person's own outline, grown like the drawn one, so none of them shows.
                 person = (cv2.dilate(full, kernel) if kernel is not None else full) > 0
+                if args.depth_background:
+                    person = cv2.dilate(person.astype(np.uint8), halo) > 0
                 freed = person & (grown == 0)
                 if freed.any():
-                    frame = paint_room(frame, original, freed, person)
+                    frame = paint_room(frame, backdrop, freed, person)
         writer.stdin.write(np.ascontiguousarray(frame).tobytes())
     writer.stdin.close()
     if writer.wait() != 0:
