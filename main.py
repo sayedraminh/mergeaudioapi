@@ -2359,6 +2359,9 @@ class CompositeMasksRequest(BaseModel):
     # Draw each person this share of every mask row narrower per side, with the
     # room painted over the freed edge (composite worker only). 0 keeps the outline.
     slim_share: float = Field(default=0, ge=0, le=0.2)
+    # Flat gray people over the depth video instead of depth people over the
+    # original (needs depth_url and the composite worker).
+    depth_background: bool = False
 
 
 class CompositeMasksResponse(MergeResponse):
@@ -2371,6 +2374,8 @@ class CompositeMasksResponse(MergeResponse):
     has_audio: bool
     # The slim_share actually drawn: 0 when the FFmpeg fallback ran, which can't slim.
     slim_share: float = 0
+    # True when the people were drawn over the depth video (older servers never say so).
+    depth_background: bool = False
 
 
 # Demuxers that only read the downloaded bytes. Playlist-style formats (hls,
@@ -2610,14 +2615,19 @@ def run_guide_worker(args: List[str], label: str, timeout: int) -> dict:
     return json.loads(lines[-1])
 
 
-def composite_depth_people(video_path: str, depth_path: Optional[str], mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True, slim_share: float = 0) -> dict:
-    """Depth (or flat gray without a depth video) inside the SAM mask, the original frame everywhere else."""
+def composite_depth_people(video_path: str, depth_path: Optional[str], mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True, slim_share: float = 0, depth_background: bool = False) -> dict:
+    """Depth (or flat gray without a depth video) inside the SAM mask, the original frame everywhere else.
+
+    With depth_background, flat gray inside the mask and the depth video everywhere else.
+    """
     source = probe_video_stream(video_path)
     frames, width, height = source["frames"], source["width"], source["height"]
     fps = round(source["fps"])
     if not frames or not fps:
         raise ValueError("Could not read the normalized video")
     duration = frames / fps
+    if depth_background and not (depth_path and os.path.isfile(FACE_MESH_PYTHON)):
+        raise ValueError("depth_background needs depth_url and the composite worker (run setup-face-mesh.sh)")
     if os.path.isfile(FACE_MESH_PYTHON):
         args = [
             GUIDE_COMPOSITE_WORKER, video_path, mask_dir, output_path,
@@ -2625,6 +2635,8 @@ def composite_depth_people(video_path: str, depth_path: Optional[str], mask_dir:
         ]
         if depth_path:
             args += ["--depth", depth_path]
+        if depth_background:
+            args.append("--depth-background")
         if fill_holes:
             args.append("--fill-holes")
         if slim_share:
@@ -2781,7 +2793,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
             masked_frames, _ = await asyncio.to_thread(
                 unpack_mask_zips, [(path, item.start_frame) for item, path in zip(request.mask_zips, zip_paths)], mask_dir, frames,
             )
-            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels, request.fill_holes, request.slim_share)
+            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels, request.fill_holes, request.slim_share, request.depth_background)
             schedule_file_deletion(output_path)
             completed = True
             return CompositeMasksResponse(
@@ -2789,7 +2801,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
                 processing_time_seconds=round(time.perf_counter() - started, 3),
                 width=meta["width"], height=meta["height"], fps=meta["fps"], frames=meta["frames"],
                 masked_frames=masked_frames, duration_seconds=round(meta["duration"], 6), has_audio=bool(audio_path),
-                slim_share=meta.get("slim_share", 0),
+                slim_share=meta.get("slim_share", 0), depth_background=request.depth_background,
             )
         except MediaProcessingError as error:
             raise HTTPException(status_code=422, detail=error.public_detail())
@@ -2819,25 +2831,37 @@ class FaceMeshRequest(BaseModel):
     video_url: HttpUrl
     guide_url: HttpUrl
     max_faces: int = Field(default=4, ge=1, le=8)
+    # Cut each hidden face's silhouette back to a plain head, painting the
+    # original's hair outline over with the depth around it (depth-background guides).
+    trim_heads: bool = False
+    # False only trims: a clip without talking or singing gets no mesh.
+    draw_mesh: bool = True
 
 
 class FaceMeshResponse(MergeResponse):
     frames: int
     tracked_frames: int
     faces: int
+    # Echoed so a client can tell a server that trims from one that ignored the field.
+    trimmed_heads: bool = False
 
 
 def face_mesh_installed() -> bool:
     return all(os.path.isfile(path) for path in (FACE_MESH_PYTHON, FACE_MESH_MODEL, FACE_DETECTOR_MODEL))
 
 
-def draw_face_mesh(source_path: str, guide_path: str, output_path: str, max_faces: int) -> dict:
+def draw_face_mesh(source_path: str, guide_path: str, output_path: str, max_faces: int, trim_heads: bool = False, draw_mesh: bool = True) -> dict:
     # Same length cap as the other guide endpoints.
     for path in (source_path, guide_path):
         frames = probe_video_stream(path)["frames"]
         if not frames or frames > GUIDE_MAX_FRAMES:
             raise ValueError("Face mesh input frame count is out of range")
-    summary = run_guide_worker([FACE_MESH_WORKER, source_path, guide_path, output_path, FACE_MESH_MODEL, "--detector", FACE_DETECTOR_MODEL, "--max-faces", str(max_faces)], "Face mesh", 240)
+    args = [FACE_MESH_WORKER, source_path, guide_path, output_path, FACE_MESH_MODEL, "--detector", FACE_DETECTOR_MODEL, "--max-faces", str(max_faces)]
+    if trim_heads:
+        args.append("--trim-heads")
+    if not draw_mesh:
+        args.append("--no-mesh")
+    summary = run_guide_worker(args, "Face mesh", 240)
     validate_rendered_output(output_path)
     return summary
 
@@ -2858,13 +2882,13 @@ async def face_mesh_endpoint(request: FaceMeshRequest, _: bool = Depends(verify_
             await asyncio.gather(download_file(str(request.video_url), source_path), download_file(str(request.guide_url), guide_path))
             for path in (source_path, guide_path):
                 await asyncio.to_thread(assert_safe_media, path)
-            summary = await asyncio.to_thread(draw_face_mesh, source_path, guide_path, output_path, request.max_faces)
+            summary = await asyncio.to_thread(draw_face_mesh, source_path, guide_path, output_path, request.max_faces, request.trim_heads, request.draw_mesh)
             schedule_file_deletion(output_path)
             completed = True
             return FaceMeshResponse(
                 success=True, message="Face mesh drawn", output_path=output_path,
                 processing_time_seconds=round(time.perf_counter() - started, 3),
-                frames=int(summary["frames"]), tracked_frames=int(summary["tracked_frames"]), faces=int(summary["faces"]),
+                frames=int(summary["frames"]), tracked_frames=int(summary["tracked_frames"]), faces=int(summary["faces"]), trimmed_heads=request.trim_heads,
             )
         except MediaProcessingError as error:
             raise HTTPException(status_code=422, detail=error.public_detail())

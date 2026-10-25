@@ -15,7 +15,14 @@ out: the mesh of a profile lands on the cheek or the back of the head. Faces
 the guide shows as filmed (it hides only the people being replaced) are left
 out too, so no mesh is drawn onto a real face.
 
-usage: face_mesh_worker.py SOURCE GUIDE OUTPUT MODEL --detector YUNET [--max-faces N]
+With --trim-heads (guides whose silhouettes sit on a depth background), each
+hidden face's silhouette is cut back to a plain head: the outline of the
+original's hair (long hair, a bun, an updo) around the face, down to just
+below the chin, is painted over with the depth around it. A video model
+follows the silhouette's shape, so it drew that hair on the replacement
+whatever the prompt said. --no-mesh trims without drawing the mesh.
+
+usage: face_mesh_worker.py SOURCE GUIDE OUTPUT MODEL --detector YUNET [--max-faces N] [--trim-heads] [--no-mesh]
 Prints one JSON line: {"frames": n, "tracked_frames": n, "faces": max_faces_seen}
 """
 import argparse
@@ -47,6 +54,20 @@ SMOOTH_DISTANCE = 0.25
 # A face whose guide pixels differ from the source by less than this (mean, 0-255)
 # is shown as filmed, not hidden under a silhouette, and gets no mesh.
 FILMED_DIFF = 25
+
+# --trim-heads, in shares of the face mesh's box (w x h, top y0, bottom y1):
+# the head kept is an oval HEAD_AXES wide and tall around (center, y0 + HEAD_TOP h);
+# the hair cleared is the rest of an oval TRIM_AXES around (center, y0 + TRIM_TOP h),
+# down to y1 + TRIM_BELOW_CHIN h, except a neck band NECK_HALF_WIDTH w either side
+# of the center below y1 - NECK_START h.
+HEAD_AXES, HEAD_TOP = (0.62, 0.80), 0.42
+TRIM_AXES, TRIM_TOP, TRIM_BELOW_CHIN = (1.3, 1.25), 0.35, 0.25
+NECK_HALF_WIDTH, NECK_START = 0.42, 0.1
+# A face this large (share of the frame) is a close-up whose hair runs off the
+# frame; trimming it would cut the shoulders.
+TRIM_MAX_FACE = (0.6, 0.8)
+# The composite's flat gray (126) after encoding: every channel within this of it.
+SILHOUETTE_GRAY, SILHOUETTE_SPREAD = 126, 12
 
 # RGB: frames are decoded as rgb24.
 TESSELATION = (50, 170, 205)
@@ -101,6 +122,48 @@ def hidden(source, guide, cx, cy, size):
     return float(np.abs(patch - covered).mean()) >= FILMED_DIFF
 
 
+def trim_heads(frame, faces):
+    """Paints over the hair outline around each face, where the guide is silhouette gray, with the depth around it."""
+    height, width = frame.shape[:2]
+    gray = np.abs(frame.astype(np.int16) - SILHOUETTE_GRAY).max(axis=2) <= SILHOUETTE_SPREAD
+    yy, xx = np.ogrid[0:height, 0:width]
+    heads = np.zeros((height, width), bool)
+    trim = np.zeros((height, width), bool)
+    for points in faces:
+        xs, ys = [x for x, _ in points], [y for _, y in points]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        w, h = max(1, x1 - x0), max(1, y1 - y0)
+        cx = (x0 + x1) / 2
+        heads |= ((xx - cx) / (HEAD_AXES[0] * w)) ** 2 + ((yy - (y0 + HEAD_TOP * h)) / (HEAD_AXES[1] * h)) ** 2 <= 1
+        if w > TRIM_MAX_FACE[0] * width or h > TRIM_MAX_FACE[1] * height:
+            continue
+        ring = ((xx - cx) / (TRIM_AXES[0] * w)) ** 2 + ((yy - (y0 + TRIM_TOP * h)) / (TRIM_AXES[1] * h)) ** 2 <= 1
+        ring &= yy <= y1 + TRIM_BELOW_CHIN * h
+        ring &= ~((yy > y1 - NECK_START * h) & (np.abs(xx - cx) <= NECK_HALF_WIDTH * w))
+        trim |= ring
+    # No face's head is cut by a neighbour's ring. The silhouette's encoded edge
+    # blends into the depth, so the cut reaches two pixels past the gray, or a
+    # dotted outline of the old hair would stay.
+    trim &= (cv2.dilate(gray.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0) & ~heads
+    if not trim.any():
+        return frame
+    # Half-size inpaint from the non-silhouette pixels (the depth) around the trimmed area.
+    ys, xs = np.nonzero(trim)
+    margin = 24
+    y0, y1 = max(0, ys.min() - margin), min(height, ys.max() + margin + 1)
+    x0, x1 = max(0, xs.min() - margin), min(width, xs.max() + margin + 1)
+    crop = np.ascontiguousarray(frame[y0:y1, x0:x1])
+    hide = np.where(gray[y0:y1, x0:x1], 255, 0).astype(np.uint8)
+    small = (max(1, (x1 - x0) // 2), max(1, (y1 - y0) // 2))
+    hidden = cv2.dilate((cv2.resize(hide, small, interpolation=cv2.INTER_AREA) > 0).astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
+    patch = cv2.inpaint(cv2.resize(crop, small, interpolation=cv2.INTER_AREA), hidden, 3, cv2.INPAINT_TELEA)
+    patch = cv2.resize(patch, (x1 - x0, y1 - y0), interpolation=cv2.INTER_LINEAR)
+    out = frame.copy()
+    region = trim[y0:y1, x0:x1]
+    out[y0:y1, x0:x1][region] = patch[region]
+    return out
+
+
 def landmarks_in_crop(landmarker, frame, cx, cy, side):
     """478 face points in frame pixels from a square crop around (cx, cy), or None for no face or a profile."""
     ratio = CROP_SIZE / side
@@ -135,6 +198,8 @@ def main():
     parser.add_argument("model")
     parser.add_argument("--detector", required=True)
     parser.add_argument("--max-faces", type=int, default=4)
+    parser.add_argument("--trim-heads", action="store_true")
+    parser.add_argument("--no-mesh", action="store_true")
     args = parser.parse_args()
 
     sw, sh, source_frames, fps = probe(args.source)
@@ -178,13 +243,15 @@ def main():
             boxes = [steady((x + w / 2, y + h / 2, max(w, h)), previous) for x, y, w, h, *_ in boxes]
             previous = boxes
             frame = guide.copy()
-            faces = 0
+            found_faces = []
             for cx, cy, size in boxes:
                 points = landmarks_in_crop(landmarker, source, cx, cy, size * CROP_SCALE)
-                if points is None:
-                    continue
-                faces += 1
-                points = [(round(x * gw / sw), round(y * gh / sh)) for x, y in points]
+                if points is not None:
+                    found_faces.append([(round(x * gw / sw), round(y * gh / sh)) for x, y in points])
+            faces = len(found_faces)
+            if args.trim_heads and found_faces:
+                frame = trim_heads(frame, found_faces)
+            for points in [] if args.no_mesh else found_faces:
                 for edges, color, width in groups:
                     for edge in edges:
                         cv2.line(frame, points[edge.start], points[edge.end], color, width * scale, cv2.LINE_AA)

@@ -112,3 +112,29 @@ def test_face_mesh_kills_the_worker_and_its_children_on_timeout(mesh, monkeypatc
         time.sleep(0.1)
     else:
         pytest.fail("the worker's child process survived the timeout")
+
+
+def test_trim_heads_cuts_the_hair_outline_but_keeps_the_head_neck_and_body():
+    np = pytest.importorskip("numpy")
+    pytest.importorskip("cv2")
+    pytest.importorskip("mediapipe")
+    import face_mesh_worker as worker
+
+    depth = (80, 40, 120)
+    frame = np.zeros((200, 200, 3), np.uint8)
+    frame[:] = depth
+    # A gray silhouette: long hair falling past the shoulders around a face, then a body.
+    frame[25:140, 60:140] = 126   # the hair mass, with a bun on top
+    frame[120:200, 50:150] = 126  # shoulders and body
+    face = [(85, 60), (115, 60), (85, 100), (115, 100)]  # the mesh's box: 30 wide, 40 tall
+    out = worker.trim_heads(frame, [face]).astype(int)
+    gray = lambda y, x: np.abs(out[y, x] - 126).max() <= 12
+    assert gray(80, 100), "the face stays"
+    assert gray(108, 100), "the neck stays"
+    assert gray(190, 100), "the body below the chin stays"
+    assert not gray(80, 66) and not gray(80, 134), "the hair beside the face is cut"
+    assert not gray(30, 100), "the bun above the head is cut"
+    assert np.abs(out[80, 66] - depth).max() <= 30, "the cut is painted with the depth around it"
+    assert (out[5, 5] == depth).all(), "the background is untouched"
+    huge = [(10, 5), (190, 5), (10, 195), (190, 195)]
+    assert (worker.trim_heads(frame, [huge]) == frame).all(), "a face filling the frame is never trimmed"

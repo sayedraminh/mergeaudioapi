@@ -79,3 +79,42 @@ def test_slim_paints_the_room_over_the_freed_edge():
         freed = out[person & ~drawn]
         assert freed[:, 0].max() < 80 and freed[:, 2].min() > 120, f"no body color in the freed edge ({top},{left})"
         assert (out[drawn] == (200, 0, 0)).all(), "the drawn person is untouched"
+
+
+def test_depth_background_draws_gray_people_over_the_depth_and_paints_over_their_depth_outline(tmp_path):
+    import subprocess
+    import sys
+
+    def video(path, color):
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={color}:s=96x64:r=24:d=0.25",
+                        "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p", str(path)], check=True)
+
+    original, depth, output = tmp_path / "original.mp4", tmp_path / "depth.mp4", tmp_path / "guide.mp4"
+    video(original, "0x0000c8")  # the filmed room is blue
+    # Depth: far purple, with the hidden person near and orange (wider than the mask, like loose hair).
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0x502878:s=96x64:r=24:d=0.25",
+                    "-vf", "drawbox=x=30:y=10:w=36:h=54:color=0xf0a028:t=fill", "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p", str(depth)], check=True)
+    masks = tmp_path / "masks"
+    masks.mkdir()
+    mask = np.zeros((64, 96), np.uint8)
+    mask[16:64, 36:60] = 255
+    for index in range(6):
+        cv2.imwrite(str(masks / f"mask_{index:05d}.png"), mask)
+    subprocess.run([sys.executable, worker.__file__, str(original), str(masks), str(output), "--frames", "6", "--fps", "24",
+                    "--width", "96", "--height", "64", "--depth", str(depth), "--depth-background", "--fill-holes"], check=True, capture_output=True)
+    frames = np.frombuffer(subprocess.run(["ffmpeg", "-v", "error", "-i", str(output), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                                          check=True, capture_output=True).stdout, np.uint8).reshape(-1, 64, 96, 3).astype(int)
+    assert len(frames) == 6
+    last = frames[-1]
+    assert np.abs(last[40, 48] - 126).max() <= 6, "the person is flat gray"
+    assert np.abs(last[5, 5] - (0x50, 0x28, 0x78)).max() <= 12, "the background is the depth video, not the filmed room"
+    outline = last[30:60, 31:34]  # the depth's own orange person, just outside the mask
+    assert np.abs(outline - (0x50, 0x28, 0x78)).max(axis=2).max() <= 40, "the depth outline of the hidden person is painted over"
+
+
+def test_depth_background_needs_a_depth_video(tmp_path):
+    import subprocess
+    import sys
+    result = subprocess.run([sys.executable, worker.__file__, "v.mp4", str(tmp_path), "o.mp4", "--frames", "1", "--fps", "24",
+                             "--width", "8", "--height", "8", "--depth-background"], capture_output=True, text=True)
+    assert result.returncode != 0 and "--depth-background needs --depth" in result.stderr
