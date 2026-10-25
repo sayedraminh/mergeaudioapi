@@ -123,28 +123,45 @@ def hidden(source, guide, cx, cy, size):
 
 
 def trim_heads(frame, faces):
-    """Paints over the hair outline around each face, where the guide is silhouette gray, with the depth around it."""
+    """Paints over the hair outline around each face, on that face's own silhouette, with the depth around it."""
     height, width = frame.shape[:2]
-    gray = np.abs(frame.astype(np.int16) - SILHOUETTE_GRAY).max(axis=2) <= SILHOUETTE_SPREAD
-    yy, xx = np.ogrid[0:height, 0:width]
+    gray = (np.abs(frame.astype(np.int16) - SILHOUETTE_GRAY).max(axis=2) <= SILHOUETTE_SPREAD).astype(np.uint8)
+    # Only the silhouette a face sits on is cut: a neighbour's shoulder or arm
+    # inside the ring is someone else's and stays.
+    _, people = cv2.connectedComponents(gray, connectivity=8)
+
+    def oval(cx, cy, ax, ay, bottom=None):
+        """A filled oval as (mask, y slice, x slice), clipped to the frame."""
+        y0, y1 = max(0, int(cy - ay)), min(height, int(cy + ay) + 1 if bottom is None else int(min(cy + ay, bottom)) + 1)
+        x0, x1 = max(0, int(cx - ax)), min(width, int(cx + ax) + 1)
+        yy, xx = np.ogrid[y0:max(y0, y1), x0:max(x0, x1)]
+        return ((xx - cx) / ax) ** 2 + ((yy - cy) / ay) ** 2 <= 1, slice(y0, max(y0, y1)), slice(x0, max(x0, x1))
+
+    boxes = []
     heads = np.zeros((height, width), bool)
-    trim = np.zeros((height, width), bool)
     for points in faces:
         xs, ys = [x for x, _ in points], [y for _, y in points]
         x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
-        w, h = max(1, x1 - x0), max(1, y1 - y0)
-        cx = (x0 + x1) / 2
-        heads |= ((xx - cx) / (HEAD_AXES[0] * w)) ** 2 + ((yy - (y0 + HEAD_TOP * h)) / (HEAD_AXES[1] * h)) ** 2 <= 1
+        w, h, cx = max(1, x1 - x0), max(1, y1 - y0), (x0 + x1) / 2
+        head, rows, cols = oval(cx, y0 + HEAD_TOP * h, HEAD_AXES[0] * w, HEAD_AXES[1] * h)
+        heads[rows, cols] |= head
+        boxes.append((cx, y0, y1, w, h))
+    trim = np.zeros((height, width), bool)
+    for cx, y0, y1, w, h in boxes:
         if w > TRIM_MAX_FACE[0] * width or h > TRIM_MAX_FACE[1] * height:
             continue
-        ring = ((xx - cx) / (TRIM_AXES[0] * w)) ** 2 + ((yy - (y0 + TRIM_TOP * h)) / (TRIM_AXES[1] * h)) ** 2 <= 1
-        ring &= yy <= y1 + TRIM_BELOW_CHIN * h
+        owner = people[min(height - 1, int(y0 + h / 2)), min(width - 1, int(cx))]
+        if not owner:
+            continue
+        ring, rows, cols = oval(cx, y0 + TRIM_TOP * h, TRIM_AXES[0] * w, TRIM_AXES[1] * h, bottom=y1 + TRIM_BELOW_CHIN * h)
+        yy, xx = np.ogrid[rows, cols]
         ring &= ~((yy > y1 - NECK_START * h) & (np.abs(xx - cx) <= NECK_HALF_WIDTH * w))
-        trim |= ring
-    # No face's head is cut by a neighbour's ring. The silhouette's encoded edge
-    # blends into the depth, so the cut reaches two pixels past the gray, or a
-    # dotted outline of the old hair would stay.
-    trim &= (cv2.dilate(gray.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0) & ~heads
+        # The silhouette's encoded edge blends into the depth, so the cut reaches
+        # two pixels past the gray, or a dotted outline of the old hair would stay.
+        own = cv2.dilate((people[rows, cols] == owner).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        trim[rows, cols] |= ring & own
+    # No face's head is cut by a neighbour's ring.
+    trim &= ~heads
     if not trim.any():
         return frame
     # Half-size inpaint from the non-silhouette pixels (the depth) around the trimmed area.
@@ -153,7 +170,7 @@ def trim_heads(frame, faces):
     y0, y1 = max(0, ys.min() - margin), min(height, ys.max() + margin + 1)
     x0, x1 = max(0, xs.min() - margin), min(width, xs.max() + margin + 1)
     crop = np.ascontiguousarray(frame[y0:y1, x0:x1])
-    hide = np.where(gray[y0:y1, x0:x1], 255, 0).astype(np.uint8)
+    hide = np.where(gray[y0:y1, x0:x1] > 0, 255, 0).astype(np.uint8)
     small = (max(1, (x1 - x0) // 2), max(1, (y1 - y0) // 2))
     hidden = cv2.dilate((cv2.resize(hide, small, interpolation=cv2.INTER_AREA) > 0).astype(np.uint8) * 255, np.ones((3, 3), np.uint8))
     patch = cv2.inpaint(cv2.resize(crop, small, interpolation=cv2.INTER_AREA), hidden, 3, cv2.INPAINT_TELEA)

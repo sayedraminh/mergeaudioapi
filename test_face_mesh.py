@@ -136,5 +136,10 @@ def test_trim_heads_cuts_the_hair_outline_but_keeps_the_head_neck_and_body():
     assert not gray(30, 100), "the bun above the head is cut"
     assert np.abs(out[80, 66] - depth).max() <= 30, "the cut is painted with the depth around it"
     assert (out[5, 5] == depth).all(), "the background is untouched"
+    neighbour = frame.copy()
+    neighbour[0:100, 0:56] = 126  # someone else's arm raised beside the hair, not touching it
+    kept = worker.trim_heads(neighbour, [face]).astype(int)
+    assert np.abs(kept[60, 40] - 126).max() <= 12, "a neighbour's silhouette inside the ring stays"
+    assert np.abs(kept[80, 66] - depth).max() <= 30, "the face's own hair is still cut"
     huge = [(10, 5), (190, 5), (10, 195), (190, 195)]
     assert (worker.trim_heads(frame, [huge]) == frame).all(), "a face filling the frame is never trimmed"
