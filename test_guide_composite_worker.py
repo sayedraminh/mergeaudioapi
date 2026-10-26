@@ -118,3 +118,48 @@ def test_depth_background_needs_a_depth_video(tmp_path):
     result = subprocess.run([sys.executable, worker.__file__, "v.mp4", str(tmp_path), "o.mp4", "--frames", "1", "--fps", "24",
                              "--width", "8", "--height", "8", "--depth-background"], capture_output=True, text=True)
     assert result.returncode != 0 and "--depth-background needs --depth" in result.stderr
+
+
+def test_red_tint_draws_the_filmed_people_under_red_over_the_depth_in_their_full_outline(tmp_path):
+    import subprocess
+    import sys
+
+    def video(path, color, box=""):
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c={color}:s=96x64:r=24:d=0.25", *(["-vf", box] if box else []),
+                        "-c:v", "libx264", "-qp", "0", "-pix_fmt", "yuv444p", str(path)], check=True)
+
+    original, depth, output = tmp_path / "original.mp4", tmp_path / "depth.mp4", tmp_path / "guide.mp4"
+    video(original, "0x0000c8")  # the filmed people and room are blue
+    video(depth, "0x404040", "drawbox=x=30:y=10:w=36:h=54:color=0xe0e0e0:t=fill")  # gray depth, the hidden person near and wider than the mask
+    masks = tmp_path / "masks"
+    masks.mkdir()
+    mask = np.zeros((64, 96), np.uint8)
+    mask[16:64, 36:60] = 255
+    for index in range(6):
+        cv2.imwrite(str(masks / f"mask_{index:05d}.png"), mask)
+    run = subprocess.run([sys.executable, worker.__file__, str(original), str(masks), str(output), "--frames", "6", "--fps", "24", "--width", "96", "--height", "64",
+                          "--depth", str(depth), "--depth-background", "--red-tint", "--fill-holes", "--slim", "0.2", "--spread", "2"], check=True, capture_output=True, text=True)
+    assert '"faces_covered_frames": 0' in run.stdout
+    last = np.frombuffer(subprocess.run(["ffmpeg", "-v", "error", "-i", str(output), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                                        check=True, capture_output=True).stdout, np.uint8).reshape(-1, 64, 96, 3).astype(int)[-1]
+    tinted = (0.5 * 255, 0, 0.5 * 0xc8)
+    assert np.abs(last[40, 48] - tinted).max() <= 8, "the person is the filmed footage under red"
+    assert np.abs(last[40, 37] - tinted).max() <= 8, "the outline is never slimmed"
+    assert np.abs(last[5, 5] - 0x40).max() <= 8, "the background is the depth video"
+    assert np.abs(last[30:60, 31:34] - 0x40).max() <= 40, "the depth outline of the hidden person is painted over"
+
+
+def test_red_tint_needs_the_depth_background(tmp_path):
+    import subprocess
+    import sys
+    result = subprocess.run([sys.executable, worker.__file__, "v.mp4", str(tmp_path), "o.mp4", "--frames", "1", "--fps", "24",
+                             "--width", "8", "--height", "8", "--depth", "d.mp4", "--red-tint"], capture_output=True, text=True)
+    assert result.returncode != 0 and "--red-tint needs --depth-background" in result.stderr
+
+
+def test_face_cover_covers_each_face_a_few_frames_either_side():
+    faces = [[], [], [(10, 10, 20, 20)], [], [], [], [], [], []]
+    assert worker.face_cover(faces, 6, (64, 64))[19, 20], "four frames later the face is still covered"
+    assert not worker.face_cover(faces, 7, (64, 64)).any(), "five frames later it is not"
+    cover = worker.face_cover(faces, 2, (64, 64))
+    assert cover[5, 20] and cover[30, 20] and not cover[40, 20], "the oval runs from the hairline to the chin"
