@@ -309,6 +309,13 @@ output expires after 120 seconds, so download each one via
    the background's depth, so the guide has no dark outline. Without that
    environment the FFmpeg-only composite runs.
 
+   `depth_background: true` (worker only) draws the people flat gray over the
+   depth video instead. Add `red_tint: true` to draw them as the original
+   footage under a translucent red tint, in their full outline (`slim_share`
+   is ignored), with each face YuNet finds on them covered in solid red. The
+   response echoes `depth_background` and `red_tint` and counts
+   `faces_covered_frames`; older servers leave them out.
+
 ## Face mesh
 
 `POST /face-mesh` `{"video_url": "<normalized clip>", "guide_url": "<composite guide>", "max_faces": 4}`

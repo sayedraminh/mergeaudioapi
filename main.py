@@ -2362,6 +2362,9 @@ class CompositeMasksRequest(BaseModel):
     # Flat gray people over the depth video instead of depth people over the
     # original (needs depth_url and the composite worker).
     depth_background: bool = False
+    # With depth_background: the people as the original footage under a
+    # translucent red tint instead of flat gray, faces covered in solid red.
+    red_tint: bool = False
 
 
 class CompositeMasksResponse(MergeResponse):
@@ -2376,6 +2379,10 @@ class CompositeMasksResponse(MergeResponse):
     slim_share: float = 0
     # True when the people were drawn over the depth video (older servers never say so).
     depth_background: bool = False
+    # True when the people were drawn red-tinted; faces_covered_frames counts
+    # the frames where a face was covered (0 without the face detector).
+    red_tint: bool = False
+    faces_covered_frames: int = 0
 
 
 # Demuxers that only read the downloaded bytes. Playlist-style formats (hls,
@@ -2615,10 +2622,11 @@ def run_guide_worker(args: List[str], label: str, timeout: int) -> dict:
     return json.loads(lines[-1])
 
 
-def composite_depth_people(video_path: str, depth_path: Optional[str], mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True, slim_share: float = 0, depth_background: bool = False) -> dict:
+def composite_depth_people(video_path: str, depth_path: Optional[str], mask_dir: str, audio_path: Optional[str], output_path: str, spread_pixels: int, fill_holes: bool = True, slim_share: float = 0, depth_background: bool = False, red_tint: bool = False) -> dict:
     """Depth (or flat gray without a depth video) inside the SAM mask, the original frame everywhere else.
 
-    With depth_background, flat gray inside the mask and the depth video everywhere else.
+    With depth_background, flat gray inside the mask and the depth video everywhere else;
+    with red_tint too, the original people under red inside the mask, faces solid red.
     """
     source = probe_video_stream(video_path)
     frames, width, height = source["frames"], source["width"], source["height"]
@@ -2628,6 +2636,8 @@ def composite_depth_people(video_path: str, depth_path: Optional[str], mask_dir:
     duration = frames / fps
     if depth_background and not (depth_path and os.path.isfile(FACE_MESH_PYTHON)):
         raise ValueError("depth_background needs depth_url and the composite worker (run setup-face-mesh.sh)")
+    if red_tint and not depth_background:
+        raise ValueError("red_tint needs depth_background")
     if os.path.isfile(FACE_MESH_PYTHON):
         args = [
             GUIDE_COMPOSITE_WORKER, video_path, mask_dir, output_path,
@@ -2637,18 +2647,25 @@ def composite_depth_people(video_path: str, depth_path: Optional[str], mask_dir:
             args += ["--depth", depth_path]
         if depth_background:
             args.append("--depth-background")
+        if red_tint:
+            args.append("--red-tint")
+            # Without YuNet the faces stay tinted, not covered.
+            if os.path.isfile(FACE_DETECTOR_MODEL):
+                args += ["--face-detector", FACE_DETECTOR_MODEL]
         if fill_holes:
             args.append("--fill-holes")
         if slim_share:
             args += ["--slim", str(slim_share)]
         if audio_path:
             args += ["--audio", audio_path]
-        run_guide_worker(args, "Mask composite", 300)
+        report = run_guide_worker(args, "Mask composite", 300)
         validate_rendered_output(output_path)
         rendered = probe_video_stream(output_path)
         if rendered["frames"] != frames:
             raise ValueError(f"Composite has {rendered['frames']} frames, expected {frames}")
-        return {"width": width, "height": height, "fps": fps, "frames": frames, "duration": duration, "slim_share": slim_share}
+        # The red tint draws the full outline, never slimmed.
+        return {"width": width, "height": height, "fps": fps, "frames": frames, "duration": duration, "slim_share": 0 if red_tint else slim_share,
+                "faces_covered_frames": int(report.get("faces_covered_frames", 0))}
     mask_chain = f"scale={width}:{height}:flags=neighbor,format=gray,lut=y='if(gt(val,127),255,0)'"
     if fill_holes:
         mask_chain += f",{FILL_HOLES_CHAIN}"
@@ -2793,7 +2810,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
             masked_frames, _ = await asyncio.to_thread(
                 unpack_mask_zips, [(path, item.start_frame) for item, path in zip(request.mask_zips, zip_paths)], mask_dir, frames,
             )
-            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels, request.fill_holes, request.slim_share, request.depth_background)
+            meta = await asyncio.to_thread(composite_depth_people, video_path, depth_path, mask_dir, audio_path, output_path, request.spread_pixels, request.fill_holes, request.slim_share, request.depth_background, request.red_tint)
             schedule_file_deletion(output_path)
             completed = True
             return CompositeMasksResponse(
@@ -2802,6 +2819,7 @@ async def composite_masks_endpoint(request: CompositeMasksRequest, _: bool = Dep
                 width=meta["width"], height=meta["height"], fps=meta["fps"], frames=meta["frames"],
                 masked_frames=masked_frames, duration_seconds=round(meta["duration"], 6), has_audio=bool(audio_path),
                 slim_share=meta.get("slim_share", 0), depth_background=request.depth_background,
+                red_tint=request.red_tint, faces_covered_frames=meta.get("faces_covered_frames", 0),
             )
         except MediaProcessingError as error:
             raise HTTPException(status_code=422, detail=error.public_detail())

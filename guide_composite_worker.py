@@ -35,10 +35,17 @@ Mask cleanup, per frame:
   Anything also draws the hidden people, with their hair and loose strands, so
   a band around each silhouette (and the edge --slim frees) is painted over
   from the depth around it.
+- With --red-tint (over --depth-background) the people are the original
+  footage under a translucent red tint, inside their full outline (never
+  slimmed or spread), so the video model reads their exact pose, hands and
+  feet; gray silhouettes lost a raised finger and drew a flying cloak's
+  outline as a cape (dunk clip, Oct 25). With --face-detector, each face
+  YuNet finds on those people is covered in solid red, a few frames either
+  side too, so the original face can't be read through the tint.
 
 usage: guide_composite_worker.py VIDEO MASK_DIR OUTPUT --frames N --fps F
-       [--depth PATH [--depth-background]] [--spread PX] [--fill-holes] [--slim SHARE] [--audio PATH]
-Prints one JSON line: {"frames": n, "masked_frames": n, "dropped_border_pixels": n}
+       [--depth PATH [--depth-background [--red-tint [--face-detector ONNX]]]] [--spread PX] [--fill-holes] [--slim SHARE] [--audio PATH]
+Prints one JSON line: {"frames": n, "masked_frames": n, "dropped_border_pixels": n, "faces_covered_frames": n}
 """
 import argparse
 import itertools
@@ -77,6 +84,13 @@ SLIM_FILL_MARGIN = 40
 # --depth-background: how far past the drawn silhouette the depth video's own
 # outline of the hidden person is painted over.
 DEPTH_HALO_PIXELS = 6
+# --red-tint: how much red is mixed into the filmed people.
+RED_TINT_OPACITY = 0.5
+RED = np.array([255, 0, 0], np.uint8)
+# YuNet scores below this are not faces; a face also covers this many frames
+# either side, for frames where YuNet misses it.
+FACE_SCORE = 0.6
+FACE_HOLD_FRAMES = 4
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # The people's color when no depth video is given: SAM's outline alone.
 FLAT_FILL = np.full(3, 126, np.uint8)
@@ -245,6 +259,50 @@ def depth_with_ring(depth, mask, grown):
     return filled
 
 
+def mask_at(mask_dir, index, width, height):
+    raw = read_mask(os.path.join(mask_dir, f"mask_{index:05d}.png"), width, height)
+    if raw.shape != (height, width):
+        raw = cv2.resize(raw, (width, height), interpolation=cv2.INTER_NEAREST)
+    return np.where(raw > 127, 255, 0).astype(np.uint8)
+
+
+def find_faces(video, mask_dir, detector_path, width, height, frames):
+    """Per frame, the YuNet face boxes (x, y, w, h) whose center lies on a masked person."""
+    detector = cv2.FaceDetectorYN.create(detector_path, "", (width, height), FACE_SCORE, 0.3, 5000)
+    found = []
+    for index, original in enumerate(reader(video, width, height, frames)):
+        mask = mask_at(mask_dir, index, width, height)
+        _, faces = detector.detect(cv2.cvtColor(original, cv2.COLOR_RGB2BGR)) if mask.any() else (None, None)
+        boxes = []
+        for x, y, w, h in (faces[:, :4] if faces is not None else []):
+            cx, cy = int(x + w / 2), int(y + h / 2)
+            if 0 <= cx < width and 0 <= cy < height and mask[cy, cx]:
+                boxes.append((x, y, w, h))
+        found.append(boxes)
+    return found
+
+
+def face_cover(faces, index, shape):
+    """The faces of frames around `index`, each as an oval from hairline to chin, a little wider than its box."""
+    cover = np.zeros(shape, np.uint8)
+    for boxes in faces[max(0, index - FACE_HOLD_FRAMES):index + FACE_HOLD_FRAMES + 1]:
+        for x, y, w, h in boxes:
+            cv2.ellipse(cover, (int(x + w / 2), int(y + h * 0.45)), (int(w * 0.62), int(h * 0.72)), 0, 0, 360, 255, -1)
+    return cover > 0
+
+
+def tint_people(original, depth, mask, cover, kernel, halo):
+    """The filmed people under red (solid red over `cover`) on the depth, with the depth's own outline of them painted over."""
+    drawn = mask > 0
+    frame = depth.copy()
+    frame[drawn] = (original[drawn] * (1 - RED_TINT_OPACITY) + RED * RED_TINT_OPACITY).astype(np.uint8)
+    if cover is not None:
+        frame[cover] = RED
+    # Depth Anything draws the people too, hair and all: a band around them is painted from the depth around it.
+    person = cv2.dilate(cv2.dilate(mask, kernel) if kernel is not None else mask, halo) > 0
+    return paint_room(frame, depth, person & ~drawn, person)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("video")
@@ -260,11 +318,17 @@ def main():
     parser.add_argument("--audio")
     parser.add_argument("--depth")
     parser.add_argument("--depth-background", action="store_true")
+    parser.add_argument("--red-tint", action="store_true")
+    parser.add_argument("--face-detector")
     args = parser.parse_args()
     if not 0 <= args.slim <= 0.5:
         raise SystemExit("--slim must be between 0 and 0.5")
     if args.depth_background and not args.depth:
         raise SystemExit("--depth-background needs --depth")
+    if args.red_tint and not args.depth_background:
+        raise SystemExit("--red-tint needs --depth-background")
+    if args.face_detector and not args.red_tint:
+        raise SystemExit("--face-detector needs --red-tint")
     width, height, frames, fps = args.width, args.height, args.frames, args.fps
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * args.spread + 1, 2 * args.spread + 1)) if args.spread else None
@@ -283,14 +347,12 @@ def main():
     writer = subprocess.Popen(command, stdin=subprocess.PIPE)
     masked = 0
     dropped_total = 0
+    faces = find_faces(args.video, args.mask_dir, args.face_detector, width, height, frames) if args.face_detector else None
+    covered = 0
     originals = reader(args.video, width, height, frames)
     depths = reader(args.depth, width, height, frames, f"fps={fps},scale={width}:{height}:flags=bilinear,tpad=stop_mode=clone:stop_duration=1") if args.depth else itertools.repeat(None)
     for index, (original, depth) in enumerate(zip(originals, depths)):
-        raw = read_mask(os.path.join(args.mask_dir, f"mask_{index:05d}.png"), width, height)
-        if raw.shape != (height, width):
-            raw = cv2.resize(raw, (width, height), interpolation=cv2.INTER_NEAREST)
-        mask = np.where(raw > 127, 255, 0).astype(np.uint8)
-        mask, dropped = drop_stray_pieces(mask)
+        mask, dropped = drop_stray_pieces(mask_at(args.mask_dir, index, width, height))
         dropped_total += dropped
         if mask.any() and depth is not None:
             mask, dropped = drop_far_edge_pixels(mask, depth)
@@ -305,26 +367,31 @@ def main():
             masked += 1
             if args.fill_holes:
                 mask = fill_holes(mask)
-            full = mask
-            if args.slim:
-                thin = slim_mask(mask, args.slim)
-                mask = thin if thin.any() else mask
-            grown = cv2.dilate(mask, kernel) if kernel is not None else mask
-            fill = FLAT_FILL if depth is None or args.depth_background else depth_with_ring(depth, mask, grown)
-            frame = np.where(grown[..., None] > 0, fill, backdrop)
-            if args.slim or args.depth_background:
-                # The person's own outline, grown like the drawn one, so none of them shows.
-                person = (cv2.dilate(full, kernel) if kernel is not None else full) > 0
-                if args.depth_background:
-                    person = cv2.dilate(person.astype(np.uint8), halo) > 0
-                freed = person & (grown == 0)
-                if freed.any():
-                    frame = paint_room(frame, backdrop, freed, person)
+            if args.red_tint:
+                cover = face_cover(faces, index, mask.shape) & (mask > 0) if faces is not None else None
+                covered += int(cover is not None and cover.any())
+                frame = tint_people(original, depth, mask, cover, kernel, halo)
+            else:
+                full = mask
+                if args.slim:
+                    thin = slim_mask(mask, args.slim)
+                    mask = thin if thin.any() else mask
+                grown = cv2.dilate(mask, kernel) if kernel is not None else mask
+                fill = FLAT_FILL if depth is None or args.depth_background else depth_with_ring(depth, mask, grown)
+                frame = np.where(grown[..., None] > 0, fill, backdrop)
+                if args.slim or args.depth_background:
+                    # The person's own outline, grown like the drawn one, so none of them shows.
+                    person = (cv2.dilate(full, kernel) if kernel is not None else full) > 0
+                    if args.depth_background:
+                        person = cv2.dilate(person.astype(np.uint8), halo) > 0
+                    freed = person & (grown == 0)
+                    if freed.any():
+                        frame = paint_room(frame, backdrop, freed, person)
         writer.stdin.write(np.ascontiguousarray(frame).tobytes())
     writer.stdin.close()
     if writer.wait() != 0:
         raise SystemExit("Encoding the composite failed")
-    print(json.dumps({"frames": frames, "masked_frames": masked, "dropped_border_pixels": dropped_total}))
+    print(json.dumps({"frames": frames, "masked_frames": masked, "dropped_border_pixels": dropped_total, "faces_covered_frames": covered}))
 
 
 if __name__ == "__main__":
