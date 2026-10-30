@@ -2310,6 +2310,17 @@ class CompressVideoRequest(BaseModel):
     max_short_side: int = Field(default=1080, ge=240, le=2160)
 
 
+class WatermarkVideoRequest(BaseModel):
+    video_url: HttpUrl
+
+
+class WatermarkVideoResponse(MergeResponse):
+    duration_seconds: float
+    width: int
+    height: int
+    has_audio: bool
+
+
 class CompressVideoResponse(MergeResponse):
     size_bytes: int
     duration_seconds: float
@@ -3002,6 +3013,78 @@ async def compress_video_endpoint(request: CompressVideoRequest, _: bool = Depen
             raise HTTPException(status_code=400, detail="Failed to download video")
         except subprocess.TimeoutExpired:
             raise HTTPException(status_code=422, detail="Video compression timed out")
+        finally:
+            cleanup_files([input_path, None if completed else output_path])
+
+
+# ---- Watermark ---------------------------------------------------------------
+# The "nsketch.ai" mark on videos people download from the Nsketch community.
+
+WATERMARK_IMAGE_PATH = os.path.join(BASE_DIR, "assets", "nsketch-watermark.png")
+WATERMARK_MAX_SECONDS = 120
+WATERMARK_MAX_LONG_SIDE = 4096
+# The mark's width and its distance from the corner, as shares of the video's short side.
+WATERMARK_WIDTH_SHARE = 0.26
+WATERMARK_MARGIN_SHARE = 0.04
+
+
+def watermark_video(input_path: str, output_path: str) -> dict:
+    """Burn the nsketch.ai mark into the bottom-right corner, keeping size, length and audio."""
+    assert_safe_media(input_path)
+    duration = get_media_duration(input_path)
+    if not math.isfinite(duration) or duration <= 0 or duration > WATERMARK_MAX_SECONDS:
+        raise ValueError(f"Video must be at most {WATERMARK_MAX_SECONDS} seconds")
+    width, height = get_video_dimensions(input_path)
+    if max(width, height) > WATERMARK_MAX_LONG_SIDE:
+        raise ValueError(f"Video must be at most {WATERMARK_MAX_LONG_SIDE} pixels on its long side")
+    short_side = min(width, height)
+    mark_width = max(2, int(short_side * WATERMARK_WIDTH_SHARE) // 2 * 2)
+    margin = int(short_side * WATERMARK_MARGIN_SHARE)
+    has_audio = has_audio_stream(input_path)
+    filter_complex = (
+        f"[1:v]scale={mark_width}:-1,format=rgba[mark];"
+        # H.264 4:2:0 needs even sides; odd-sized inputs get one padded row or column.
+        f"[0:v:0][mark]overlay=x=W-w-{margin}:y=H-h-{margin}:shortest=1:format=auto,pad=ceil(iw/2)*2:ceil(ih/2)*2[vout]"
+    )
+    audio = ["-map", "0:a:0", "-c:a", "aac", "-b:a", "192k"] if has_audio else ["-an"]
+    run_compress_step([
+        "ffmpeg", "-y", "-i", input_path, "-loop", "1", "-i", WATERMARK_IMAGE_PATH,
+        "-filter_complex", filter_complex, "-map", "[vout]", *audio,
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-t", f"{duration:.6f}", "-movflags", "+faststart", output_path,
+    ], "Video watermark")
+    validate_rendered_output(output_path)
+    out_width, out_height = get_video_dimensions(output_path)
+    return {"duration": get_media_duration(output_path), "width": out_width, "height": out_height, "has_audio": has_audio}
+
+
+@app.post("/watermark", response_model=WatermarkVideoResponse)
+async def watermark_video_endpoint(request: WatermarkVideoRequest, _: bool = Depends(verify_api_key)):
+    """Burn the nsketch.ai watermark into a video (H.264 MP4, same size and length, audio kept)."""
+    async with processing_semaphore:
+        started = time.perf_counter()
+        session_id = uuid.uuid4().hex
+        input_path = os.path.join(TEMP_DIR, f"watermark_input_{session_id}")
+        output_path = os.path.join(OUTPUT_DIR, f"watermarked_{session_id}.mp4")
+        completed = False
+        try:
+            await download_file(str(request.video_url), input_path)
+            meta = await asyncio.to_thread(watermark_video, input_path, output_path)
+            schedule_file_deletion(output_path)
+            completed = True
+            return WatermarkVideoResponse(
+                success=True, message="Video watermarked", output_path=output_path,
+                processing_time_seconds=round(time.perf_counter() - started, 3),
+                duration_seconds=round(meta["duration"], 3), width=meta["width"], height=meta["height"], has_audio=meta["has_audio"],
+            )
+        except MediaProcessingError as error:
+            raise HTTPException(status_code=422, detail=error.public_detail())
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error))
+        except httpx.HTTPError:
+            raise HTTPException(status_code=400, detail="Failed to download video")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=422, detail="Video watermark timed out")
         finally:
             cleanup_files([input_path, None if completed else output_path])
 
