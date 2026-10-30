@@ -8,11 +8,11 @@ from fastapi.testclient import TestClient
 import main
 
 
-def make_clip(path, size, seconds, audio=True):
+def make_clip(path, size, seconds, audio=True, pix_fmt="yuv420p"):
     sources = ["-f", "lavfi", "-i", f"color=c=black:size={size}:rate=30:duration={seconds}"]
     if audio:
         sources += ["-f", "lavfi", "-i", f"sine=duration={seconds}", "-shortest", "-c:a", "aac"]
-    subprocess.run(["ffmpeg", "-v", "error", "-y", *sources, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", str(path)], check=True)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", *sources, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", pix_fmt, str(path)], check=True)
 
 
 @pytest.fixture
@@ -95,3 +95,12 @@ def test_watermark_rejects_oversized_frame(watermark_client, monkeypatch):
     response = watermark(client, "https://example.com/big.mp4")
     assert response.status_code == 422
     assert "long side" in response.json()["detail"]
+
+
+def test_watermark_pads_odd_sizes_to_even(watermark_client):
+    client, tmp_path, sources, _ = watermark_client
+    sources["https://example.com/odd.mp4"] = tmp_path / "odd.mp4"
+    make_clip(sources["https://example.com/odd.mp4"], "721x1281", 1, pix_fmt="yuv444p")
+    response = watermark(client, "https://example.com/odd.mp4")
+    assert response.status_code == 200, response.text
+    assert (response.json()["width"], response.json()["height"]) == (722, 1282)

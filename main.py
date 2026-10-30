@@ -3043,7 +3043,8 @@ def watermark_video(input_path: str, output_path: str) -> dict:
     has_audio = has_audio_stream(input_path)
     filter_complex = (
         f"[1:v]scale={mark_width}:-1,format=rgba[mark];"
-        f"[0:v:0][mark]overlay=x=W-w-{margin}:y=H-h-{margin}:shortest=1:format=auto[vout]"
+        # H.264 4:2:0 needs even sides; odd-sized inputs get one padded row or column.
+        f"[0:v:0][mark]overlay=x=W-w-{margin}:y=H-h-{margin}:shortest=1:format=auto,pad=ceil(iw/2)*2:ceil(ih/2)*2[vout]"
     )
     audio = ["-map", "0:a:0", "-c:a", "aac", "-b:a", "192k"] if has_audio else ["-an"]
     run_compress_step([
